@@ -3129,10 +3129,13 @@ export class InteractiveMode {
 	}
 
 	private getWorkingLoaderMessage(): string {
-		const elapsed =
-			this.workingStartedAt === undefined
-				? undefined
-				: this.formatWorkingElapsed(Date.now() - this.workingStartedAt);
+		// Prefer the daemon-provided turn-start anchor (fork fix: timer-startedat)
+		// so the elapsed timer survives detach/reattach; fall back to the
+		// client-local clock when absent (e.g. in-process sessions with no daemon
+		// connection state, or an older daemon that predates this field).
+		const activityStartedAt = this.connectionState?.activityStartedAt;
+		const startAnchor = activityStartedAt !== undefined ? activityStartedAt : this.workingStartedAt;
+		const elapsed = startAnchor === undefined ? undefined : this.formatWorkingElapsed(Date.now() - startAnchor);
 		const status = this.activityTracker.getStatus();
 		// The subagent count/recaps live in the tree above the loader, so the loader
 		// message itself no longer repeats "N subagents running".

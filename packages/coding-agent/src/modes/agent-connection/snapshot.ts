@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentSession } from "../../core/agent-session.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
@@ -19,6 +20,29 @@ function persistedRecap(sessionManager: {
 	return sessionManager.getLatestAgentStatus?.()?.summary;
 }
 
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
+
+/**
+ * Turn-start anchor for the working-loader elapsed timer (fork fix:
+ * timer-startedat). The last user message timestamp while streaming is the
+ * closest available proxy for "when did the current turn begin"; the agent
+ * core does not record a dedicated streaming-start timestamp.
+ */
+function lastUserMessageTimestamp(messages: readonly AgentMessage[]): number | undefined {
+	let latest: number | undefined;
+	for (const message of messages) {
+		if (
+			message.role === "user" &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp) &&
+			Math.abs(message.timestamp) <= MAX_DATE_TIMESTAMP_MS
+		) {
+			latest = latest === undefined ? message.timestamp : Math.max(latest, message.timestamp);
+		}
+	}
+	return latest;
+}
+
 export function createAgentConnectionState(
 	runtime: AgentSessionRuntime,
 	activeSessionId?: string,
@@ -33,6 +57,7 @@ export function createAgentConnectionState(
 		serviceTier: session.serviceTier,
 		availableThinkingLevels: session.getAvailableThinkingLevels(),
 		isStreaming: session.isStreaming,
+		activityStartedAt: session.isStreaming ? lastUserMessageTimestamp(session.messages) : undefined,
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
 		retryAttempt: session.retryAttempt,
