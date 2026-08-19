@@ -28,3 +28,4 @@ hardening/secrets-scan
 hardening/sync-script
 hardening/swap-script
 hardening/deterministic-build
+fix/daemon-shortcuts
