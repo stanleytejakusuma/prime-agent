@@ -26,3 +26,4 @@ feat/sibling-doctrine
 feat/keybind-catalog
 hardening/secrets-scan
 hardening/sync-script
+hardening/swap-script
