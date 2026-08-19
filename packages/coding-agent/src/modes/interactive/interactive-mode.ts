@@ -4150,6 +4150,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.effort.cycle", () => this.cycleEffortLevel());
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
@@ -6013,6 +6014,10 @@ export class InteractiveMode {
 		}
 		if (this.keybindings.matches(data, "app.thinking.toggle")) {
 			this.toggleThinkingBlockVisibility();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.effort.cycle")) {
+			this.cycleEffortLevel();
 			return;
 		}
 		this.focusEditor();
@@ -8034,6 +8039,26 @@ export class InteractiveMode {
 		void this.agentConnection
 			.setThinkingLevel(level)
 			.then(() => {
+				this.patchConnectionState({ thinkingLevel: level });
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+				this.showStatus(`Thinking level: ${level}`);
+			})
+			.catch((error) => {
+				this.showError(error instanceof Error ? error.message : String(error));
+			});
+	}
+
+	private cycleEffortLevel(): void {
+		const levels = this.getAvailableThinkingLevels();
+		if (levels.length === 0) {
+			this.showStatus("Current model does not support thinking");
+			return;
+		}
+		void this.agentConnection
+			.cycleThinkingLevel()
+			.then((level) => {
+				if (level === undefined) return;
 				this.patchConnectionState({ thinkingLevel: level });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
