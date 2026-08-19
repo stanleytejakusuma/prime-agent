@@ -563,6 +563,83 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // inline limit before storing, so this holds many recent pastes; the oldest are
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * A pasted image, plus the on-disk path it was persisted to (fork fix:
+ * image-paste). Pasted images previously lived only in the in-memory
+ * pastedImages registry, keyed by [image #N] markers; a resumed session
+ * (fresh process) has an empty registry, so a message still containing the
+ * marker text arrived at the agent with no image bytes at all. Persisting to
+ * disk on paste and falling back to the persisted file on registry miss fixes
+ * that, and surfacing the path lets a non-vision model route the image
+ * through an image-digest-style skill instead of silently losing it.
+ */
+type PersistedImageContent = ImageContent & { readonly path?: string };
+
+const ATTACHMENTS_DIR_NAME = "attachments";
+
+export function attachmentExtension(mimeType: string | undefined): string {
+	const match = mimeType ? /^image\/([a-zA-Z0-9+.-]+)$/.exec(mimeType) : null;
+	if (!match) {
+		return ".png";
+	}
+	const subtype = match[1]?.toLowerCase();
+	if (subtype === "jpeg") {
+		return ".jpg";
+	}
+	if (subtype === "svg+xml") {
+		return ".svg";
+	}
+	return subtype ? `.${subtype}` : ".png";
+}
+
+export function attachmentDirFor(sessionId: string | undefined): string {
+	return path.join(getAgentDir(), ATTACHMENTS_DIR_NAME, sessionId || "unknown");
+}
+
+export function attachmentPathFor(
+	sessionId: string | undefined,
+	markerId: number,
+	mimeType: string | undefined,
+): string {
+	return path.join(attachmentDirFor(sessionId), `image-${markerId}${attachmentExtension(mimeType)}`);
+}
+
+export function persistPastedImageAttachment(
+	sessionId: string | undefined,
+	markerId: number,
+	image: ImageContent,
+): string | undefined {
+	try {
+		const dir = attachmentDirFor(sessionId);
+		fs.mkdirSync(dir, { recursive: true });
+		const attachmentPath = attachmentPathFor(sessionId, markerId, image.mimeType);
+		fs.writeFileSync(attachmentPath, Buffer.from(image.data, "base64"));
+		return attachmentPath;
+	} catch {
+		// Persistence is best-effort: a failed write still leaves the in-memory
+		// registry working for the current process, it just will not survive a
+		// resume. Never let a disk error block the paste itself.
+		return undefined;
+	}
+}
+
+export function readPastedImageAttachment(
+	sessionId: string | undefined,
+	markerId: number,
+	mimeType: string,
+): PersistedImageContent | undefined {
+	try {
+		const attachmentPath = attachmentPathFor(sessionId, markerId, mimeType);
+		if (!fs.existsSync(attachmentPath)) {
+			return undefined;
+		}
+		const data = fs.readFileSync(attachmentPath).toString("base64");
+		return { type: "image", data, mimeType, path: attachmentPath };
+	} catch {
+		return undefined;
+	}
+}
 const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
@@ -1004,7 +1081,7 @@ export class InteractiveMode {
 	// MAX_PASTED_IMAGE_BYTES) so a marker resolves to its image whenever the text
 	// reappears — on submit, undo, history recall, retry, or dequeue. A submission
 	// attaches only the images whose markers are present in the sent text.
-	private pastedImages = new Map<number, ImageContent>();
+	private pastedImages = new Map<number, PersistedImageContent>();
 	private nextImageMarkerId = 1;
 
 	private unsubscribe?: () => void;
@@ -4342,8 +4419,11 @@ export class InteractiveMode {
 
 	private getPromptStashImages(text: string): readonly (readonly [number, ImageContent])[] {
 		const images: Array<readonly [number, ImageContent]> = [];
+		const sessionId = this.connectionState?.sessionId;
 		for (const markerId of imageMarkerIds(text)) {
-			const image = this.pastedImages.get(markerId);
+			// Resume case: the in-memory registry is empty in a fresh process, so
+			// fall back to the persisted attachment (fork fix: image-paste).
+			const image = this.pastedImages.get(markerId) ?? readPastedImageAttachment(sessionId, markerId, "image/png");
 			if (image) {
 				images.push([markerId, image]);
 			}
@@ -4395,7 +4475,10 @@ export class InteractiveMode {
 	 * are never evicted, so a live marker never loses its image.
 	 */
 	private rememberPastedImage(id: number, image: ImageContent): void {
-		this.pastedImages.set(id, image);
+		const sessionId = this.connectionState?.sessionId;
+		const attachmentPath = persistPastedImageAttachment(sessionId, id, image);
+		const stored: PersistedImageContent = attachmentPath ? { ...image, path: attachmentPath } : image;
+		this.pastedImages.set(id, stored);
 		const keep = this.liveImageMarkerIds();
 		keep.add(id);
 		evictImagesToBudget(this.pastedImages, (img) => img.data.length, MAX_PASTED_IMAGE_BYTES, keep);
