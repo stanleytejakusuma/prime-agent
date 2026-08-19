@@ -248,6 +248,47 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("does not send extension shortcut commands to an old daemon lacking the capability, even at the current schema revision", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		// The capability is authoritative even when an old daemon reports the
+		// current schema revision for unrelated backports.
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION);
+
+		await expect(client.request({ type: "get_extension_shortcuts", activeSessionId: "active-1" })).rejects.toThrow(
+			"does not support extension_shortcuts",
+		);
+		await expect(
+			client.request({
+				type: "run_extension_shortcut",
+				activeSessionId: "active-1",
+				key: "ctrl+e",
+				extensionPath: "/tmp/ext.ts",
+			}),
+		).rejects.toThrow("does not support extension_shortcuts");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("sends extension shortcut commands when the capability is present even if the schema revision is stale", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		// The server capability is the compatibility authority. Schema revision
+		// is informational here, so an independently backported daemon works.
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["extension_shortcuts"], 16);
+
+		const request = client.request({ type: "get_extension_shortcuts", activeSessionId: "active-1" });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
