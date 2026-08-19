@@ -14,9 +14,10 @@
 		"build": "cd packages/tui && npm run build && cd ../ai && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build",
 		"dev": "concurrently --names \"ai,agent,coding-agent,tui\" --prefix-colors \"cyan,yellow,red,magenta\" \"cd packages/ai && npm run dev\" \"cd packages/agent && npm run dev\" \"cd packages/coding-agent && npm run dev\" \"cd packages/tui && npm run dev\"",
 		"dev:tsc": "cd packages/ai && npm run dev:tsc",
-		"check": "biome check --write --error-on-warnings . && tsgo --noEmit && npm run check:installer && npm run check:browser-smoke",
+		"check": "biome check --write --error-on-warnings . && tsgo --noEmit && npm run check:installer && npm run check:browser-smoke && npm run check:boot-gate",
 		"check:installer": "node scripts/check-installer-render.mjs",
 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
+		"check:boot-gate": "node scripts/fork/boot-verify.mjs packages/coding-agent/dist/bundle/cli.js",
 		"profile:tui": "node scripts/profile-coding-agent-node.mjs --mode tui",
 		"profile:rpc": "node scripts/profile-coding-agent-node.mjs --mode rpc",
 		"test": "npm run test --workspaces --if-present",
@@ -48,7 +49,7 @@
 	"engines": {
 		"node": ">=22.8.0"
 	},
-	"version": "0.8.0",
+	"version": "0.8.0+fork.8d7deeab5",
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "^0.8.0",
 		"get-east-asian-width": "^1.6.0"
