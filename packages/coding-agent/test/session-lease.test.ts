@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
@@ -8,9 +8,11 @@ import {
 	acquireSessionLease,
 	canonicalSessionPath,
 	getWindowsProcessStartId,
+	hasLiveSessionLease,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
+	sweepStaleSessionLeases,
 } from "../src/core/session-lease.js";
 
 const tempDirs: string[] = [];
@@ -185,5 +187,137 @@ describe("session leases", () => {
 	it("is inert for direct SDK runtimes unless worker isolation enables it", () => {
 		const agentDir = createTempDir();
 		expect(acquireSessionLease(join(agentDir, "session.jsonl"), agentDir, {})).toBeUndefined();
+	});
+});
+
+describe("sweepStaleSessionLeases (fork fix: ghost-sweep)", () => {
+	it("reclaims a lease directory whose owner process is dead", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "dead-owner.jsonl"));
+		const key = createHash("sha256").update(sessionPath).digest("hex");
+		const lockDirectory = join(agentDir, "session-leases", `${key}.lock`);
+		mkdirSync(lockDirectory, { recursive: true });
+		writeFileSync(
+			join(lockDirectory, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				token: "stale",
+				pid: 2_147_483_647,
+				activeSessionId: "dead-owner",
+				sessionPath,
+				createdAt: new Date(0).toISOString(),
+			}),
+		);
+
+		const swept = sweepStaleSessionLeases(agentDir);
+
+		expect(swept).toBe(1);
+		expect(existsSync(lockDirectory)).toBe(false);
+	});
+
+	it("never touches a lease directory whose owner process is genuinely alive", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "live-owner.jsonl"));
+		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("resident"));
+
+		try {
+			const swept = sweepStaleSessionLeases(agentDir);
+
+			expect(swept).toBe(0);
+			// The lease must still be acquirable/held; a second acquisition from a
+			// different owner is still refused, proving the lease survived.
+			expect(() => acquireSessionLease(sessionPath, agentDir, enabledEnvironment("intruder"))).toThrow(
+				SessionAlreadyActiveError,
+			);
+		} finally {
+			lease?.release();
+		}
+	});
+
+	it("reclaims a malformed lease directory whose owner.json cannot be parsed", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "malformed.jsonl"));
+		const key = createHash("sha256").update(sessionPath).digest("hex");
+		const lockDirectory = join(agentDir, "session-leases", `${key}.lock`);
+		mkdirSync(lockDirectory, { recursive: true });
+		writeFileSync(join(lockDirectory, "owner.json"), "not valid json{{{");
+
+		const swept = sweepStaleSessionLeases(agentDir);
+
+		expect(swept).toBe(1);
+		expect(existsSync(lockDirectory)).toBe(false);
+	});
+
+	it("returns 0 without throwing when the session-leases directory does not exist yet", () => {
+		const agentDir = createTempDir();
+
+		expect(sweepStaleSessionLeases(agentDir)).toBe(0);
+	});
+
+	it("sweeps multiple dead leases in one pass and leaves live ones alone", () => {
+		const agentDir = createTempDir();
+
+		const deadPath1 = canonicalSessionPath(resolve(agentDir, "dead-1.jsonl"));
+		const deadKey1 = createHash("sha256").update(deadPath1).digest("hex");
+		mkdirSync(join(agentDir, "session-leases", `${deadKey1}.lock`), { recursive: true });
+		writeFileSync(
+			join(agentDir, "session-leases", `${deadKey1}.lock`, "owner.json"),
+			JSON.stringify({ version: 1, token: "a", pid: 2_147_483_647, sessionPath: deadPath1, createdAt: "x" }),
+		);
+
+		const deadPath2 = canonicalSessionPath(resolve(agentDir, "dead-2.jsonl"));
+		const deadKey2 = createHash("sha256").update(deadPath2).digest("hex");
+		mkdirSync(join(agentDir, "session-leases", `${deadKey2}.lock`), { recursive: true });
+		writeFileSync(
+			join(agentDir, "session-leases", `${deadKey2}.lock`, "owner.json"),
+			JSON.stringify({ version: 1, token: "b", pid: 2_147_483_646, sessionPath: deadPath2, createdAt: "x" }),
+		);
+
+		const livePath = canonicalSessionPath(resolve(agentDir, "live.jsonl"));
+		const lease = acquireSessionLease(livePath, agentDir, enabledEnvironment("resident"));
+
+		try {
+			expect(sweepStaleSessionLeases(agentDir)).toBe(2);
+			expect(() => acquireSessionLease(livePath, agentDir, enabledEnvironment("intruder"))).toThrow(
+				SessionAlreadyActiveError,
+			);
+		} finally {
+			lease?.release();
+		}
+	});
+});
+
+describe("hasLiveSessionLease (fork fix: ghost-sweep)", () => {
+	it("is true for a session with a genuinely live lease", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "live.jsonl"));
+		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("resident"));
+
+		try {
+			expect(hasLiveSessionLease(agentDir, sessionPath)).toBe(true);
+		} finally {
+			lease?.release();
+		}
+	});
+
+	it("is false for a session with no lease at all", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "never-leased.jsonl"));
+
+		expect(hasLiveSessionLease(agentDir, sessionPath)).toBe(false);
+	});
+
+	it("is false for a session whose lease owner is dead", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "dead.jsonl"));
+		const key = createHash("sha256").update(sessionPath).digest("hex");
+		const lockDirectory = join(agentDir, "session-leases", `${key}.lock`);
+		mkdirSync(lockDirectory, { recursive: true });
+		writeFileSync(
+			join(lockDirectory, "owner.json"),
+			JSON.stringify({ version: 1, token: "x", pid: 2_147_483_647, sessionPath, createdAt: "y" }),
+		);
+
+		expect(hasLiveSessionLease(agentDir, sessionPath)).toBe(false);
 	});
 });
