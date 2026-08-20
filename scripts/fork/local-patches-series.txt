@@ -32,3 +32,4 @@ fix/daemon-shortcuts
 feat/status-line
 fix/idle-eviction-timeout
 feat/model-catalog-parity
+fix/agents-delete-stale-draft
