@@ -31,10 +31,23 @@ export interface FooterStatusLineData {
  * extension statuses. Without a provider it renders nothing, preserving the
  * original empty-footer behavior for callers that do not opt in.
  *
- * The provider is invoked lazily on every render, so any existing
- * `footer.invalidate()` call site in interactive-mode picks up fresh state
- * without extra plumbing. Data is read-only and client-local; nothing here
- * crosses the daemon wire.
+ * The provider is invoked lazily on every render (pi-tui calls render() fresh
+ * on every scheduled frame, never memoized by prior output), so any existing
+ * `footer.invalidate()` call site in interactive-mode already sees fresh
+ * state with no extra plumbing. Data is read-only and client-local; nothing
+ * here crosses the daemon wire.
+ *
+ * SECURITY / DISPLAY NOTE: extension status text (ctx.ui.setStatus()) is the
+ * one untrusted content channel rendered here. It is sanitized (control
+ * characters and newlines stripped) so it cannot break the single-line
+ * contract or inject terminal control sequences, but it is NOT redacted --
+ * an extension that writes secrets, keys, or sensitive trading state into a
+ * status string will display it on screen and it will appear in terminal
+ * recordings/screenshots. Extensions must not put sensitive data in
+ * ctx.ui.setStatus().
+ *
+ * render() never throws: any failure while deriving or formatting the line
+ * degrades to an empty footer rather than crashing the render loop.
  */
 export class FooterComponent implements Component {
 	private statusLineProvider: (() => FooterStatusLineData | undefined) | undefined;
@@ -69,15 +82,25 @@ export class FooterComponent implements Component {
 	}
 
 	render(width: number): string[] {
-		const data = this.statusLineProvider?.();
-		if (!data) {
+		if (!this.statusLineProvider) {
 			return [];
 		}
-		const line = this.buildStatusLine(data);
-		if (line.length === 0) {
+		try {
+			const data = this.statusLineProvider();
+			if (!data) {
+				return [];
+			}
+			const line = this.buildStatusLine(data);
+			if (line.length === 0) {
+				return [];
+			}
+			return [truncateToWidth(line, width, "…")];
+		} catch {
+			// The footer must never be able to crash the render loop. A bad
+			// provider read (or a future edit that introduces a throw) degrades
+			// to an empty footer instead of taking down the whole TUI.
 			return [];
 		}
-		return [truncateToWidth(line, width, "…")];
 	}
 
 	private buildStatusLine(data: FooterStatusLineData): string {
@@ -85,10 +108,10 @@ export class FooterComponent implements Component {
 
 		const modelParts: string[] = [];
 		if (data.model) {
-			modelParts.push(theme.fg("accent", data.model));
+			modelParts.push(theme.fg("accent", sanitizeInline(data.model)));
 		}
 		if (data.thinkingLevel && data.thinkingLevel !== "off" && data.thinkingLevel !== "none") {
-			modelParts.push(data.thinkingLevel);
+			modelParts.push(sanitizeInline(data.thinkingLevel));
 		}
 		if (modelParts.length > 0) {
 			segments.push(modelParts.join(" "));
@@ -99,16 +122,19 @@ export class FooterComponent implements Component {
 			segments.push(context);
 		}
 
-		if (data.turnTokens && data.turnTokens > 0) {
+		if (data.turnTokens !== undefined && Number.isFinite(data.turnTokens) && data.turnTokens > 0) {
 			segments.push(theme.fg("dim", formatTokenCount(data.turnTokens)));
 		}
 
 		if (data.gitBranch) {
-			segments.push(theme.fg("dim", `⎇ ${data.gitBranch}`));
+			segments.push(theme.fg("dim", `⎇ ${sanitizeInline(data.gitBranch)}`));
 		}
 
 		if (data.extensionStatuses && data.extensionStatuses.size > 0) {
-			const statusText = [...data.extensionStatuses.values()].filter((text) => text.length > 0).join(" | ");
+			const statusText = [...data.extensionStatuses.values()]
+				.map((text) => sanitizeInline(text))
+				.filter((text) => text.length > 0)
+				.join(" | ");
 			if (statusText.length > 0) {
 				segments.push(theme.fg("muted", statusText));
 			}
@@ -118,18 +144,33 @@ export class FooterComponent implements Component {
 	}
 
 	private formatContext(percent: number | null | undefined, tokens: number | null | undefined): string | undefined {
-		if (percent === null || percent === undefined) {
-			if (tokens === null || tokens === undefined || tokens === 0) {
+		const finiteTokens = tokens !== null && tokens !== undefined && Number.isFinite(tokens) ? tokens : undefined;
+		const finitePercent = percent !== null && percent !== undefined && Number.isFinite(percent) ? percent : undefined;
+
+		if (finitePercent === undefined) {
+			if (!finiteTokens || finiteTokens === 0) {
 				return undefined;
 			}
-			return theme.fg("dim", `${formatTokenCount(tokens)} ctx`);
+			return theme.fg("dim", `${formatTokenCount(finiteTokens)} ctx`);
 		}
-		const color = percent > 90 ? "error" : percent > 70 ? "warning" : "dim";
-		const pct = `${Math.round(percent)}%`;
-		return tokens && tokens > 0
-			? theme.fg(color, `${pct} (${formatTokenCount(tokens)})`)
+		const color = finitePercent > 90 ? "error" : finitePercent > 70 ? "warning" : "dim";
+		const pct = `${Math.round(finitePercent)}%`;
+		return finiteTokens && finiteTokens > 0
+			? theme.fg(color, `${pct} (${formatTokenCount(finiteTokens)})`)
 			: theme.fg(color, `${pct} ctx`);
 	}
+}
+
+/**
+ * Strip newlines and C0/C1 control characters (including raw ESC) from
+ * untrusted single-line display text. Extension status strings and git
+ * branch names are the only values here that do not originate from the
+ * client's own trusted state, and the footer's contract is exactly one
+ * line: a stray "\n" or an embedded ANSI/control sequence must not be able
+ * to break that contract or bleed styling/cursor movement into the frame.
+ */
+function sanitizeInline(text: string): string {
+	return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
 }
 
 function formatTokenCount(count: number): string {

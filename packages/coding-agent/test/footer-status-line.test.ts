@@ -99,14 +99,70 @@ describe("FooterComponent status line", () => {
 		}
 	});
 
-	it("colors context usage by threshold", () => {
+	it("applies visibly distinct coloring to context usage across thresholds", () => {
+		// Isolate the context segment from the model segment (also colored) by
+		// omitting model/thinkingLevel/tokens/branch, so the only ANSI escape in
+		// the line is the one under test.
 		const footer = new FooterComponent(createFooterData());
-		const renderLine = (_percent: number) => footer.render(120)[0].replace(/\u001b\[[0-9;]*m/g, "");
-		footer.setStatusLineProvider(() => ({ ...baseData, contextPercent: 45 }));
-		expect(renderLine(45)).toContain("45%");
-		footer.setStatusLineProvider(() => ({ ...baseData, contextPercent: 75 }));
-		expect(renderLine(75)).toContain("75%");
-		footer.setStatusLineProvider(() => ({ ...baseData, contextPercent: 95 }));
-		expect(renderLine(95)).toContain("95%");
+		const rawLineFor = (contextPercent: number) => {
+			footer.setStatusLineProvider(() => ({ contextPercent, contextTokens: 1000 }));
+			return footer.render(120)[0];
+		};
+		const normal = rawLineFor(45);
+		const warning = rawLineFor(75);
+		const error = rawLineFor(95);
+		const ansiEscape = /\x1b\[[0-9;]*m/;
+		for (const line of [normal, warning, error]) {
+			expect(line).toMatch(ansiEscape);
+		}
+		const colorOf = (line: string) => line.match(ansiEscape)?.[0];
+		expect(colorOf(normal)).not.toBe(colorOf(warning));
+		expect(colorOf(warning)).not.toBe(colorOf(error));
+		expect(colorOf(normal)).not.toBe(colorOf(error));
+		expect(stripAnsi(normal)).toContain("45%");
+		expect(stripAnsi(warning)).toContain("75%");
+		expect(stripAnsi(error)).toContain("95%");
+	});
+
+	it("treats non-finite context percent and tokens as unknown instead of rendering NaN", () => {
+		const footer = new FooterComponent(createFooterData());
+		footer.setStatusLineProvider(() => ({
+			model: "gpt-5.6-terra",
+			contextPercent: Number.NaN,
+			contextTokens: Number.NaN,
+			turnTokens: Number.NaN,
+		}));
+		const line = stripAnsi(footer.render(120)[0]);
+		expect(line).toBe("gpt-5.6-terra");
+		expect(line).not.toContain("NaN");
+	});
+
+	it("strips newlines and control characters from extension status text", () => {
+		const statuses = new Map([["bad", "line one\nline two\r\x1b[31mred\x07"]]);
+		const footer = new FooterComponent(createFooterData(statuses));
+		footer.setStatusLineProvider(() => ({ ...baseData, extensionStatuses: statuses }));
+		const rendered = footer.render(120);
+		expect(rendered.length).toBe(1);
+		expect(rendered[0]).not.toContain("\n");
+		expect(rendered[0]).not.toContain("\r");
+		const line = stripAnsi(rendered[0]);
+		expect(line).toContain("line one line two");
+	});
+
+	it("strips control characters from a hostile git branch name", () => {
+		const footer = new FooterComponent(createFooterData(new Map(), "feature\nrm -rf /"));
+		footer.setStatusLineProvider(() => ({ ...baseData, gitBranch: "feature\nrm -rf /" }));
+		const rendered = footer.render(120);
+		expect(rendered.length).toBe(1);
+		expect(rendered[0]).not.toContain("\n");
+	});
+
+	it("never throws and degrades to an empty footer when the provider itself throws", () => {
+		const footer = new FooterComponent(createFooterData());
+		footer.setStatusLineProvider(() => {
+			throw new Error("simulated provider failure");
+		});
+		expect(() => footer.render(120)).not.toThrow();
+		expect(footer.render(120)).toEqual([]);
 	});
 });
