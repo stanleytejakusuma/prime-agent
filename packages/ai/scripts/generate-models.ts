@@ -83,13 +83,18 @@ const EAGER_TOOL_INPUT_STREAMING_UNSUPPORTED_ANTHROPIC_MODELS = new Set([
 	"github-copilot:claude-sonnet-4.5",
 ]);
 
+// DeepSeek V4 upstream effort vocabulary is low / high / max (verified against the
+// OmniRoute Model Management handoff, fork todos #44/#45). medium and xhigh are not
+// real upstream tiers (they map to high) and MUST NOT be exposed as selectable levels;
+// max is the real top tier. off maps to "none" upstream.
 const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
+	off: "none",
 	minimal: null,
-	low: null,
+	low: "low",
 	medium: null,
 	high: "high",
-	xhigh: "max",
-	max: null,
+	xhigh: null,
+	max: "max",
 } as const;
 
 const KIMI_K3_THINKING_LEVEL_MAP = {

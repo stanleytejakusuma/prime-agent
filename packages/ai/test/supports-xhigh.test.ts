@@ -91,22 +91,44 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toContain("off");
 	});
 
-	it("includes only high/xhigh plus off for DeepSeek V4 Flash on the DeepSeek provider", () => {
-		const model = getModel("deepseek", "deepseek-v4-flash");
-		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
-	});
+	// Upstream DeepSeek V4 effort vocabulary is low / high / max only (OmniRoute
+	// Model Management handoff, fork todos #44/#45): medium and xhigh map to high
+	// upstream and must not be exposed as selectable tiers; max is the real top tier.
+	it.each(["deepseek-v4-flash", "deepseek-v4-pro"] as const)(
+		"exposes exactly off/low/high/max for DeepSeek V4 %s on the DeepSeek provider",
+		(modelId) => {
+			const model = getModel("deepseek", modelId);
+			expect(model).toBeDefined();
+			expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
+		},
+	);
 
-	it("includes only high/xhigh plus off for DeepSeek V4 Flash on opencode-go", () => {
+	it("exposes exactly off/low/high/max for DeepSeek V4 Flash on opencode-go", () => {
 		const model = getModel("opencode-go", "deepseek-v4-flash");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
 	});
 
-	it("includes only high/xhigh plus off for DeepSeek V4 Flash on OpenRouter", () => {
+	it("exposes exactly off/low/high/max for DeepSeek V4 Flash on OpenRouter", () => {
 		const model = getModel("openrouter", "deepseek/deepseek-v4-flash");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
+	});
+
+	it('maps DeepSeek V4 max to upstream "max" and pins medium/xhigh to null (hidden)', () => {
+		const model = getModel("deepseek", "deepseek-v4-pro");
+		expect(model).toBeDefined();
+		expect(model!.thinkingLevelMap).toMatchObject({
+			off: "none",
+			low: "low",
+			high: "high",
+			max: "max",
+		});
+		expect(model!.thinkingLevelMap?.medium).toBeNull();
+		expect(model!.thinkingLevelMap?.xhigh).toBeNull();
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).not.toContain("medium");
+		expect(levels).not.toContain("xhigh");
 	});
 
 	it("includes max but not xhigh for OpenRouter Opus 4.6 (openai-completions API)", () => {
