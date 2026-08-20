@@ -6071,12 +6071,13 @@ export class InteractiveMode {
 		if (!model) {
 			return undefined;
 		}
+		// Model, reasoning level, and context usage already live in the tray
+		// (getTrayLocationLabel / getTrayContextLabel, rendered just above the
+		// editor) -- this footer must not restate them or the same numbers show
+		// up twice on screen. It only carries data the tray does not already
+		// surface: current-turn tokens, git branch, and extension statuses.
 		const status = this.activityTracker.getStatus();
 		return {
-			model: model.name,
-			thinkingLevel: model.reasoning ? this.connectionState?.thinkingLevel : undefined,
-			contextPercent: this.connectionState?.contextUsage?.percent ?? null,
-			contextTokens: this.connectionState?.contextUsage?.tokens ?? null,
 			turnTokens: status.tokens,
 			gitBranch: this.footerDataProvider.getGitBranch(),
 			extensionStatuses: this.footerDataProvider.getExtensionStatuses(),
