@@ -31,3 +31,4 @@ hardening/deterministic-build
 fix/daemon-shortcuts
 feat/status-line
 fix/idle-eviction-timeout
+feat/model-catalog-parity
