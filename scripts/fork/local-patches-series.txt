@@ -34,3 +34,4 @@ fix/idle-eviction-timeout
 feat/model-catalog-parity
 fix/agents-delete-stale-draft
 feat/wayfinder-tracker-setup
+feat/supervisor-kill-file-fallback
