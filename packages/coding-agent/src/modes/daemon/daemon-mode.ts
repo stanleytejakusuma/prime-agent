@@ -1538,10 +1538,18 @@ export class AgentDaemon {
 		const cwd = resolve(config.cwd);
 		const agentDir = config.agentDir;
 		const clientEnv = filterClientEnv(command.env);
-		const cwdOverride = command.config?.cwd ? resolve(command.config.cwd) : undefined;
 		const sessionPath = command.sessionPath
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
+		// Local fix (fork, cwd-resume): only apply the client's ambient cwd as an
+		// override when genuinely creating a new session (no sessionPath). When
+		// resuming an existing session, the persisted header cwd must win --
+		// SessionManager.openAsync already defaults to it when cwdOverride is
+		// undefined, so simply not passing an override here is the correct fix.
+		// The previous unconditional override caused every resume launched from a
+		// different terminal cwd (e.g. the SYMIR root ~/codebase) to silently
+		// rewrite the session's displayed and effective working directory.
+		const cwdOverride = !sessionPath && command.config?.cwd ? resolve(command.config.cwd) : undefined;
 		const sessionKey = sessionPath ? resolve(sessionPath) : undefined;
 		if (sessionKey && this.findPassivationBySessionFile(sessionKey)) {
 			await this.waitForPassivation(sessionKey);
