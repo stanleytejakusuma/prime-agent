@@ -158,12 +158,49 @@ describe("daemon supervisor whole-tree eviction", () => {
 				type: "worker_passivate_idle_children",
 				idleEvictionMinutes: 90,
 				now,
-				limit: 2,
+				// Mirrors CHILD_PASSIVATION_PER_WORKER_CAP: this test only verifies
+				// the supervisor forwards its configured per-sweep cap on the wire,
+				// not that this specific number is correct policy.
+				limit: 20,
 			},
 			30_000,
 		);
 		expect(whollyIdle.client?.requestWorker).not.toHaveBeenCalled();
 		expect(supervisor.stopWorker).toHaveBeenCalledWith(whollyIdle, true);
+	});
+
+	it("caps per-sweep child passivation well above the old value of 2, so a worker with dozens of idle subagents behind a still-active root does not accumulate a permanent backlog", async () => {
+		// Regression for the real scenario this was diagnosed against: a single
+		// worker hosting one still-active root session plus a large RLM fan-out
+		// of subagents that finished hours ago. Whole-worker eviction never
+		// applies (canEvictWorker requires every session on the worker to be
+		// idle), so this worker relies entirely on the per-child passivation
+		// path. At the old cap of 2 per sweep, sweeps run roughly every few
+		// minutes but new subagent activity on the same worker can add idle
+		// candidates faster than 2-per-sweep drains them, so the backlog never
+		// shrinks. This asserts the wired limit is materially larger than 2.
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const summaries = [makeSummary("root", now, { isSessionActive: true })];
+		for (let i = 0; i < 48; i++) {
+			summaries.push(
+				makeSummary(`idle-child-${i}`, now, { runtimeKind: "subagent", parentActiveSessionId: "root" }),
+			);
+		}
+		const worker = makeWorker("busy-fanout", summaries);
+		worker.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_passivate_idle_children",
+			success: true,
+			data: { count: 20 },
+		});
+		supervisor.workers.set("busy-fanout", worker);
+
+		await supervisor.runIdleEvictionSweep(now);
+
+		const call = worker.client?.requestWorker.mock.calls[0]?.[0] as { limit: number } | undefined;
+		expect(call?.limit).toBeGreaterThan(2);
+		expect(call?.limit).toBeGreaterThanOrEqual(20);
 	});
 
 	it("does not fence unrelated mutations while child passivation is in flight", async () => {

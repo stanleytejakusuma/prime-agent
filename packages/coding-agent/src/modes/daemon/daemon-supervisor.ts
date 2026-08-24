@@ -159,7 +159,20 @@ const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
 const IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS = 5 * 60_000;
 const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
 const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
-const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
+// Per-sweep cap on how many idle subagent sessions get passivated on a
+// worker that is not itself a whole-worker eviction candidate (some session
+// on it, often the root, is still active). RLM fan-out routinely leaves a
+// single worker hosting dozens of completed, never-reattached subagents
+// (observed: 48 idle sessions stacked on one worker under a still-working
+// root). At the old cap of 2 per sweep, that backlog could grow faster than
+// it drained, since new subagent activity keeps landing on the same worker
+// while the root stays busy -- the idle sessions were never stuck, they
+// were queued behind an unbounded number of earlier sweep passes. Each
+// candidate already closes through its own de-duplicated, independently
+// keyed passivation (passivatingSessions), so raising this cap only widens
+// how much of the correctly oldest-first-sorted queue gets processed per
+// pass; it does not change the safety model.
+const CHILD_PASSIVATION_PER_WORKER_CAP = 20;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
 
