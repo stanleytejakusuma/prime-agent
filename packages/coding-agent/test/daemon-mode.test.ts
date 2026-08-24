@@ -10802,4 +10802,61 @@ describe("list command capability gate (session_usage_snapshot wiring)", () => {
 		});
 		expect((response as { data: { sessions: unknown[] } }).data.sessions).toEqual([]);
 	});
+	it("accepts a raw JSON-over-the-wire list command with capabilities through the real handleLine decode path (old-daemon compatibility)", async () => {
+		// Red review 2026-08-24 (footer remediation re-review): the prior two
+		// tests in this describe block call handleCommand directly with an
+		// in-memory object, bypassing the socket read / JSON.parse / envelope
+		// decode layer between the wire and the handler -- so they prove the
+		// handler tolerates the field, not that the wire-decode path does. This
+		// drives handleLine with a raw JSON string (the real socket entrypoint,
+		// already used elsewhere in this file for prompt-admission tests),
+		// including a capability this daemon build has never seen, and asserts
+		// on the actual serialized response written back to the socket.
+		//
+		// This was independently corroborated live against the actual running
+		// production daemon (0.8.0+fork.8d7deeab5, built before this branch
+		// existed): a raw socket connection sent the same envelope shape with
+		// capabilities: ["session_usage_snapshot", "totally_unknown_future_capability_xyz"]
+		// and received success:true with the full session list, confirming the
+		// claim that command parsing is JSON.parse + structural typing with no
+		// schema validator rejecting unknown properties.
+		const daemon = new AgentDaemon("/tmp/prime-agent-wire-capability-gate.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const writes: string[] = [];
+		const client = {
+			...makeClient("client-wire-cap-gate", "active-wire-cap-gate"),
+			socket: {
+				destroyed: false,
+				write: (line: string) => {
+					writes.push(line);
+					return true;
+				},
+			} as unknown as Socket,
+		};
+		const internals = daemon as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				id: "wire-cap-gate-1",
+				type: "list",
+				capabilities: ["session_usage_snapshot", "totally_unknown_future_capability_xyz"],
+			}),
+		);
+
+		expect(writes).toHaveLength(1);
+		const response = JSON.parse(writes[0]) as {
+			id: string;
+			success: boolean;
+			command: string;
+			data: { sessions: unknown[] };
+		};
+		expect(response.success).toBe(true);
+		expect(response.command).toBe("list");
+		expect(response.data.sessions).toEqual([]);
+	});
 });

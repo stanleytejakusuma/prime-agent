@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { createAgentsViewListCommand } from "../src/modes/agents-view/agents-view-mode.js";
 import {
@@ -7,6 +9,28 @@ import {
 } from "../src/modes/agents-view/agents-view-status.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+
+// Mocked so the "does not re-resolve a fresh cache entry" test can assert on
+// real invocation counts instead of an unattached spy. Resolves with a
+// synthetic "not a git repo" error on every call, matching resolveGitBranchAsync's
+// null-on-failure contract without touching a real subprocess.
+vi.mock("node:child_process", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:child_process")>();
+	return {
+		...actual,
+		execFile: vi.fn(
+			(
+				_command: string,
+				_args: string[],
+				_options: unknown,
+				callback: (error: Error | null, stdout: string) => void,
+			) => {
+				queueMicrotask(() => callback(new Error("not a git repository"), ""));
+				return new EventEmitter();
+			},
+		),
+	};
+});
 
 beforeAll(() => {
 	initTheme("light");
@@ -209,18 +233,25 @@ describe("git branch cache", () => {
 	});
 
 	it("does not re-resolve a fresh cache entry", async () => {
-		const cwd = "/tmp/fake-repo-for-cache-test";
+		// Red review 2026-08-24 (footer remediation re-review): the prior version
+		// of this test declared an unattached vi.fn() spy and asserted a
+		// nonexistent cwd resolves identically to null both times -- it could not
+		// fail even if the TTL short-circuit in refreshGitBranchCache were
+		// deleted entirely. This mocks node:child_process directly and counts
+		// real invocations, so it fails if the short-circuit regresses.
+		const cwd = "/tmp/fake-repo-for-cache-test-real-mock";
+		const execFileMock = vi.mocked(execFile);
+		execFileMock.mockClear();
 		await refreshGitBranchCache(cwd);
-		const spy = vi.fn();
-		// A second call within the TTL must be a no-op; there is no direct hook
-		// to assert "git was not spawned again" from this module's public API,
-		// so this asserts the documented contract instead: peekCachedGitBranch
-		// keeps returning the same value without needing another refresh.
+		expect(execFileMock).toHaveBeenCalledTimes(1);
 		const first = peekCachedGitBranch(cwd);
+
+		// A second call within the TTL must be a genuine no-op: no additional
+		// process spawn, and the cached value is unchanged.
 		await refreshGitBranchCache(cwd);
+		expect(execFileMock).toHaveBeenCalledTimes(1);
 		const second = peekCachedGitBranch(cwd);
 		expect(second).toBe(first);
-		expect(spy).not.toHaveBeenCalled();
 	});
 });
 
