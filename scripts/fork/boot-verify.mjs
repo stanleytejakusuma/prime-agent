@@ -9,7 +9,7 @@
 // Usage: node scripts/fork/boot-verify.mjs <path-to-bundle-cli.js>
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const bundlePath = process.argv[2];
 if (!bundlePath) {
@@ -73,6 +73,24 @@ step("throwaway daemon starts and reports status", () => {
 			encoding: "utf8",
 			timeout: 15000,
 		});
+	}
+});
+
+// 3. Fork feature presence markers. A stale or feature-dropping build silently
+//    loses UI surfaces (the status-line footer was once reported "gone" when
+//    the running bundle predated its source). These literals survive bundling
+//    and minification, so their absence means the built artifact is not the
+//    current fork. Update this list when a user-visible fork feature ships.
+step("bundle contains fork feature markers", () => {
+	const bundleText = readFileSync(bundlePath, "utf8");
+	const markers = [
+		"agents/resume", // chat tray hint (fork agents view navigation)
+		"session_usage_snapshot", // agents-view usage snapshot capability (protocol 23)
+		"setStatusLineProvider", // client footer status-line parity
+	];
+	const missing = markers.filter((marker) => !bundleText.includes(marker));
+	if (missing.length > 0) {
+		throw new Error(`missing fork feature markers: ${missing.join(", ")}`);
 	}
 });
 

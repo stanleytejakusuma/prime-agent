@@ -96,6 +96,7 @@ import {
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
+import { buildAgentsViewStatusLines } from "./agents-view-status.js";
 import { matchesSearchText } from "./session-view-search.js";
 
 const POLL_INTERVAL_MS = 1000;
@@ -210,8 +211,9 @@ export function createAgentsViewResumeConfig(
 
 export function createAgentsViewListCommand(): Extract<DaemonCommand, { type: "list" }> {
 	// Omitting `all` returns daemon-resident sessions only; on-disk ones come back
-	// through the view's saved-session catalog.
-	return { type: "list" };
+	// through the view's saved-session catalog. The usage snapshot is a protocol
+	// addition; advertising the capability asks the daemon to include it on rows.
+	return { type: "list", capabilities: ["session_usage_snapshot"] };
 }
 
 export function resolveAgentsViewActiveSummaryForPath(
@@ -2640,7 +2642,24 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private renderDock(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		return [this.renderHints(safeWidth)].map((line) => this.finalizeRenderedLine(line, safeWidth));
+		const statusLines = this.buildStatusLines(safeWidth);
+		return [...statusLines, this.renderHints(safeWidth)].map((line) => this.finalizeRenderedLine(line, safeWidth));
+	}
+
+	/** Pi-style status footer for the agents view (selected session + roster). */
+	private buildStatusLines(width: number): string[] {
+		const selected = this.rows[this.selectedIndex];
+		const summary =
+			selected && (selected.kind === "agent" || selected.kind === "subagent") ? selected.summary : undefined;
+		return buildAgentsViewStatusLines(
+			{
+				summary,
+				countsText: this.getAgentCountsText(),
+				scopeLabel: this.scopeRootSummary ? getAgentsViewSessionTitle(this.scopeRootSummary) : "global",
+				depth: getAgentsViewDepth(this.scopeRootSummary),
+			},
+			width,
+		);
 	}
 
 	private renderHints(width: number): string {
