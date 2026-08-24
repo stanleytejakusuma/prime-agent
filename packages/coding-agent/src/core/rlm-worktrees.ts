@@ -215,7 +215,11 @@ async function verifyRepoIdentity(repoRoot: string, gitCommonDir: string): Promi
 	try {
 		const result = await runGit(repoRoot, ["rev-parse", "--git-common-dir"]);
 		const observed = result.stdout.trim();
-		const resolved = observed ? realpathSync(join(repoRoot, observed)) : undefined;
+		// Linked worktrees print an absolute path; join() concatenates absolute
+		// segments instead of resetting, so branch explicitly.
+		const resolved = observed
+			? realpathSync(observed.startsWith(sep) ? observed : join(repoRoot, observed))
+			: undefined;
 		return resolved === gitCommonDir;
 	} catch {
 		return false;
@@ -554,7 +558,11 @@ export class RlmWorktreeLifecycleManager {
 			const toplevel = (await runGit(cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
 			const repoRoot = realpathSync(toplevel);
 			const commonDirOutput = (await runGit(cwd, ["rev-parse", "--git-common-dir"])).stdout.trim();
-			const gitCommonDir = realpathSync(join(cwd, commonDirOutput));
+			// Linked worktrees print an absolute path here; join() concatenates
+			// absolute segments instead of resetting, so branch explicitly.
+			const gitCommonDir = realpathSync(
+				commonDirOutput.startsWith(sep) ? commonDirOutput : join(cwd, commonDirOutput),
+			);
 			return { repoRoot, gitCommonDir };
 		} catch {
 			return undefined;

@@ -1,0 +1,2 @@
+- Added `rlm.parallel()` fan-out over `rlm.run()` with fail-stop admission, fan-in tags, and a validated harness `fan_out` spec field
+- Added opt-in `isolation="worktree"` to `rlm.run()` so children edit the same repo in isolated git worktrees with WIP-preserving cleanup

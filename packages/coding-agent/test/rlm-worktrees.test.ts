@@ -1,5 +1,14 @@
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
@@ -617,6 +626,34 @@ describe("RlmWorktreeLifecycleManager", () => {
 		expect(
 			manager.getHandleMetadata(admission.repoRoot, admission.gitCommonDir, parentSessionId, childId),
 		).toBeUndefined();
+	});
+
+	it("supports a parent session that itself runs from a linked worktree", async () => {
+		// test-plan requirement 8: repoKey derives from the canonical common dir.
+		const linkedWorktree = join(tempDir, "linked");
+		git(repoDir, "worktree", "add", "-q", "-b", "linked-branch", linkedWorktree);
+		const identity = await manager.resolveRepoIdentity(linkedWorktree);
+		expect(identity).toBeDefined();
+		// --show-toplevel is the linked checkout root; --git-common-dir is the
+		// canonical shared object/ref database of the main checkout.
+		expect(identity!.repoRoot).toBe(realpathSync(linkedWorktree));
+		expect(identity!.gitCommonDir).toBe(realpathSync(join(repoDir, ".git")));
+		const linkedSessionId = `linked-session-${Date.now()}`;
+		const admission = await manager.admitWorktree({
+			parentCwd: linkedWorktree,
+			parentSessionId: linkedSessionId,
+			childId: "sub-8888abcd",
+			childSessionDir: childSessionDirFor(),
+		});
+		// The recorded state survives reconcile with the same identity.
+		const report = await manager.reconcileNamespace({
+			parentSessionId: linkedSessionId,
+			repoRoot: admission.repoRoot,
+			gitCommonDir: admission.gitCommonDir,
+			isChildLive: () => true,
+		});
+		expect(report.some((entry) => entry.childId === "sub-8888abcd" && entry.outcome === "adopted")).toBe(true);
+		expect(existsSync(admission.worktreePath)).toBe(true);
 	});
 });
 
