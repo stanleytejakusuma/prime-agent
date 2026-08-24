@@ -330,6 +330,15 @@ export interface AgentConnectionState {
 	serviceTier: ServiceTier;
 	availableThinkingLevels: ThinkingLevel[];
 	isStreaming: boolean;
+	/**
+	 * Wall-clock timestamp (ms) when the current turn started streaming, derived
+	 * from the last user message while the session is streaming. Undefined when
+	 * idle. Lets a client render an elapsed-time indicator that survives detach
+	 * and reattach, instead of resetting to zero because the client's own local
+	 * clock only starts counting from when it last observed the stream (fork
+	 * fix: timer-startedat).
+	 */
+	activityStartedAt?: number;
 	isCompacting: boolean;
 	isBashRunning: boolean;
 	retryAttempt: number;
