@@ -40,3 +40,4 @@ fix/length-truncated-tool-calls
 feat/agents-view-status-footer
 feat/agents-view-manual-reorder
 fix/supervisor-recovery-election
+feat/agents-view-trust-capsule
