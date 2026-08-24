@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import secrets
 import sys
 import types
 from dataclasses import dataclass
@@ -30,6 +32,53 @@ class RLMSpawnHandle:
     name: str
     session_dir: Path
     model: str
+    isolation: str | None = None
+    worktree_path: str | None = None
+    worktree_branch: str | None = None
+    preservation_ref: str | None = None
+    worktree_status: str | None = None
+
+
+class RlmAdmissionError(RuntimeError):
+    """The host completed an rlm.run admission request with a deterministic rejection."""
+
+
+class RlmAdmissionTransportError(RuntimeError):
+    """The host never completed an rlm.run admission request (transport failure)."""
+
+
+@dataclass(frozen=True)
+class ParallelResult:
+    """Outcome of an rlm.parallel() admission pass (total success or partial failure)."""
+
+    handles: list["RLMSpawnHandle"]
+    tags: list[str]
+    failed_index: int | None
+    failed_name: str | None
+    error: BaseException | None
+    failed_uncertain: bool
+    name_plan: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return self.failed_index is None
+
+    @property
+    def summary(self) -> str:
+        if self.ok:
+            return f"COMPLETE: admitted {len(self.handles)}/{len(self.name_plan)} children"
+        return (
+            f"PARTIAL FAILURE: admitted {len(self.handles)}/{len(self.name_plan)}, "
+            f"failed at index {self.failed_index} (name={self.failed_name}, error={self.error})"
+        )
+
+
+class ParallelAdmissionError(Exception):
+    """Raised by rlm.parallel() on the first admission failure; exc.result is the partial outcome."""
+
+    def __init__(self, result: ParallelResult) -> None:
+        self.result = result
+        super().__init__(result.summary)
 
 
 @dataclass(frozen=True)
@@ -48,6 +97,11 @@ class RLMSubagent:
     session_name: str
     session_dir: Path
     status: str
+    isolation: str | None = None
+    worktree_path: str | None = None
+    worktree_branch: str | None = None
+    preservation_ref: str | None = None
+    worktree_status: str | None = None
 
 
 def _install_control_comm_handlers() -> None:
@@ -73,11 +127,21 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     model = payload.get("model")
     if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
         raise RuntimeError("rlm.run returned an invalid spawn handle")
+
+    def _optional_str(key: str) -> str | None:
+        value = payload.get(key)
+        return value if isinstance(value, str) and value else None
+
     return RLMSpawnHandle(
         rlm_child_id=child_id,
         name=name,
         session_dir=Path(session_dir),
         model=model,
+        isolation=_optional_str("isolation"),
+        worktree_path=_optional_str("worktree_path"),
+        worktree_branch=_optional_str("worktree_branch"),
+        preservation_ref=_optional_str("preservation_ref"),
+        worktree_status=_optional_str("worktree_status"),
     )
 
 
@@ -120,7 +184,7 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
             message = reply.get("error") or f"host request {request_type} failed"
             def _resolve_error() -> None:
                 if not future.done():
-                    future.set_exception(RuntimeError(str(message)))
+                    future.set_exception(RlmAdmissionError(str(message)))
                     comm.close()
 
             loop.call_soon_threadsafe(_resolve_error)
@@ -129,14 +193,27 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
         unexpected = f"host request {request_type} returned unexpected status: {status!r}"
         def _resolve_unexpected() -> None:
             if not future.done():
-                future.set_exception(RuntimeError(unexpected))
+                future.set_exception(RlmAdmissionError(unexpected))
                 comm.close()
 
         loop.call_soon_threadsafe(_resolve_unexpected)
 
+    def _resolve_transport_failure(detail: str) -> None:
+        if not future.done():
+            future.set_exception(
+                RlmAdmissionTransportError(f"host request {request_type} transport failure: {detail}")
+            )
+            comm.close()
+
     comm.on_msg(_on_msg)
+    comm.on_close(lambda _msg: loop.call_soon_threadsafe(
+        _resolve_transport_failure, "host closed the comm without replying"
+    ))
     # request_type goes last so a payload "type" key cannot reroute the request.
-    comm.open(data={**(payload or {}), "type": request_type})
+    try:
+        comm.open(data={**(payload or {}), "type": request_type})
+    except Exception as error:  # pragma: no cover - depends on kernel comm channel state
+        loop.call_soon_threadsafe(_resolve_transport_failure, str(error))
     try:
         return await future
     finally:
@@ -151,11 +228,185 @@ async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
     ``model`` selects a child with an exact ``provider/model`` selector.
     ``thinking`` sets the child reasoning level (e.g. 'off', 'low', 'medium', 'high');
     defaults to the parent level; levels invalid for the resolved model fail the spawn.
+    ``isolation="worktree"`` runs the child in a fresh git worktree checkout.
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _spawn_handle_from_payload(payload)
+
+
+_FANIN_TAG_RE = re.compile(r"^FANIN ([a-z0-9-]+)$")
+_RESERVED_PARALLEL_KWARGS = frozenset({"name", "name_prefix", "names", "start_index", "max_width"})
+_FANOUT_PLACEHOLDER = "<RLM_ITEM>"
+_FANOUT_SENTINEL_RE = re.compile(r"^RLM_FANOUT_ITEM_[0-9A-F]{16}$")
+
+
+def parse_fanin(message: str) -> str | None:
+    """Return the fan-in tag when the first non-empty line is exactly ``FANIN <tag>``, else None.
+
+    Strict by design: a message whose first line carries extra text is not attributed.
+    """
+    if not isinstance(message, str):
+        raise TypeError(f"message must be str, got {type(message).__name__}")
+    first = next((line.strip() for line in message.splitlines() if line.strip()), None)
+    if first is None:
+        return None
+    match = _FANIN_TAG_RE.match(first)
+    return match.group(1) if match else None
+
+
+def expand_fanout(template: str, item: str, sentinel: str) -> str:
+    """Substitute one item into a fan-out template by literal sentinel replacement.
+
+    ``str.replace`` is single-pass: items are inserted verbatim and never re-scanned,
+    so an item containing the sentinel string is safe.
+    """
+    if not isinstance(template, str):
+        raise TypeError(f"template must be str, got {type(template).__name__}")
+    if not isinstance(item, str):
+        raise TypeError(f"item must be str, got {type(item).__name__}")
+    if not isinstance(sentinel, str):
+        raise TypeError(f"sentinel must be str, got {type(sentinel).__name__}")
+    if sentinel not in template:
+        raise ValueError(f"fan-out sentinel {sentinel!r} not found in template")
+    return template.replace(sentinel, item)
+
+
+def fanout(template: str, items: list[str], sentinel: str) -> list[str]:
+    """Expand a fan-out template once per item (mechanical literal substitution only)."""
+    return [expand_fanout(template, item, sentinel) for item in items]
+
+
+def fanout_author(over: str, template: str) -> dict[str, str]:
+    """Author a fan-out spec: replace every ``<RLM_ITEM>`` placeholder with a generated sentinel.
+
+    This is the sanctioned authoring path for the harness ``fan_out`` metadata field.
+    """
+    if not isinstance(over, str) or not over:
+        raise ValueError("fan_out.over must be a non-empty str")
+    if not isinstance(template, str) or not template:
+        raise ValueError("fan_out.template must be a non-empty str")
+    if _FANOUT_PLACEHOLDER not in template:
+        raise ValueError(f"fan-out placeholder {_FANOUT_PLACEHOLDER!r} not found in template")
+    sentinel = "RLM_FANOUT_ITEM_" + secrets.token_hex(8).upper()
+    return {"over": over, "template": template.replace(_FANOUT_PLACEHOLDER, sentinel), "sentinel": sentinel}
+
+
+async def parallel(
+    prompts: list[str],
+    *,
+    name_prefix: str | None = None,
+    names: list[str] | None = None,
+    start_index: int = 0,
+    max_width: int = 20,
+    **shared_kwargs: Any,
+) -> ParallelResult:
+    """Admit N children sequentially and return (or raise) as soon as admission completes.
+
+    Fail-stop semantics: admission stops at the first error. Total success returns a
+    ``ParallelResult``; any admission failure raises ``ParallelAdmissionError`` whose
+    ``result`` holds the admitted handles and the failed index. Never blocks for
+    child answers. Exactly one of ``name_prefix`` or ``names`` is required.
+    """
+    if not isinstance(prompts, list):
+        raise TypeError(f"prompts must be a list of str, got {type(prompts).__name__}")
+    if len(prompts) < 1:
+        raise ValueError("prompts must not be empty")
+    if not isinstance(max_width, int) or isinstance(max_width, bool):
+        raise TypeError(f"max_width must be int, got {type(max_width).__name__}")
+    if max_width < 1:
+        raise ValueError("max_width must be >= 1")
+    if len(prompts) > max_width:
+        raise ValueError(
+            f"parallel() width guard: {len(prompts)} prompts exceed max_width={max_width}"
+        )
+    if (name_prefix is None) == (names is None):
+        raise ValueError("parallel() requires exactly one of name_prefix or names")
+    if not isinstance(start_index, int) or isinstance(start_index, bool):
+        raise TypeError(f"start_index must be int, got {type(start_index).__name__}")
+    if start_index < 0:
+        raise ValueError("start_index must be >= 0")
+    for index, prompt in enumerate(prompts):
+        if not isinstance(prompt, str):
+            raise TypeError(f"prompts[{index}] must be str, got {type(prompt).__name__}")
+        if not prompt:
+            raise ValueError(f"prompts[{index}] must be a non-empty str")
+    if name_prefix is not None:
+        if not isinstance(name_prefix, str):
+            raise TypeError(f"name_prefix must be str, got {type(name_prefix).__name__}")
+        if not name_prefix:
+            raise ValueError("name_prefix must be a non-empty str")
+    if names is not None:
+        if not isinstance(names, list):
+            raise TypeError(f"names must be a list of str, got {type(names).__name__}")
+        if len(names) != len(prompts):
+            raise ValueError(f"names length {len(names)} must equal prompts length {len(prompts)}")
+        for index, name in enumerate(names):
+            if not isinstance(name, str):
+                raise TypeError(f"names[{index}] must be str, got {type(name).__name__}")
+            if not name:
+                raise ValueError(f"names[{index}] must be a non-empty str")
+
+    name_plan = list(names) if names is not None else [f"{name_prefix}-{start_index + i}" for i in range(len(prompts))]
+    duplicates = sorted({name for name in name_plan if name_plan.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"parallel() name plan has duplicate names: {duplicates}")
+    reserved = sorted(_RESERVED_PARALLEL_KWARGS & set(shared_kwargs))
+    if reserved:
+        raise ValueError(
+            f"parallel() reserved kwargs must be passed as explicit parameters, not shared_kwargs: {reserved}"
+        )
+
+    nonce = secrets.token_hex(12)
+    tags = [f"fanout-{nonce}-{i}" for i in range(len(prompts))]
+    handles: list[RLMSpawnHandle] = []
+    admitted_tags: list[str] = []
+
+    def partial_result(
+        failed_index: int | None,
+        failed_name: str | None,
+        error: BaseException | None,
+        failed_uncertain: bool,
+    ) -> ParallelResult:
+        return ParallelResult(
+            handles=handles,
+            tags=admitted_tags,
+            failed_index=failed_index,
+            failed_name=failed_name,
+            error=error,
+            failed_uncertain=failed_uncertain,
+            name_plan=name_plan,
+        )
+
+    try:
+        for i, prompt in enumerate(prompts):
+            fan_in_block = (
+                "\n\n[RLM FAN-IN PROTOCOL]\n"
+                "Your final report to the parent MUST begin with exactly this line, verbatim:\n"
+                f"FANIN {tags[i]}"
+            )
+            handles.append(await run(prompt + fan_in_block, name=name_plan[i], **shared_kwargs))
+            admitted_tags.append(tags[i])
+    except asyncio.CancelledError as cancellation:
+        admitted = len(handles)
+        failed_index = admitted if admitted < len(name_plan) else None
+        failed_name = name_plan[admitted] if admitted < len(name_plan) else None
+        cancellation.partial_result = partial_result(failed_index, failed_name, None, False)
+        raise
+    except Exception as error:
+        failed_index = len(handles)
+        result = partial_result(
+            failed_index,
+            name_plan[failed_index],
+            error,
+            isinstance(error, RlmAdmissionTransportError),
+        )
+        raise ParallelAdmissionError(result) from error
+
+    return partial_result(None, None, None, False)
+
+
 
 
 def _model_from_payload(payload: Any) -> RLMModel:
@@ -204,6 +455,11 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
         raise RuntimeError(f"{operation} entry is missing session_dir")
     if status not in {"running", "completed", "error"}:
         raise RuntimeError(f"{operation} entry has invalid status")
+
+    def _optional_str(key: str) -> str | None:
+        value = payload.get(key)
+        return value if isinstance(value, str) and value else None
+
     return RLMSubagent(
         rlm_child_id=child_id,
         active_session_id=active_session_id,
@@ -211,6 +467,11 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
         session_name=session_name,
         session_dir=Path(session_dir),
         status=status,
+        isolation=_optional_str("isolation"),
+        worktree_path=_optional_str("worktree_path"),
+        worktree_branch=_optional_str("worktree_branch"),
+        preservation_ref=_optional_str("preservation_ref"),
+        worktree_status=_optional_str("worktree_status"),
     )
 
 
@@ -295,6 +556,12 @@ class _RLMCallable:
     async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
 
+    parallel = staticmethod(parallel)
+    parse_fanin = staticmethod(parse_fanin)
+    expand_fanout = staticmethod(expand_fanout)
+    fanout = staticmethod(fanout)
+    fanout_author = staticmethod(fanout_author)
+
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
         return await find_models(query, limit)
 
@@ -326,16 +593,25 @@ __all__ = [
     "McpIntegration",
     "McpToolError",
     "NotEnabled",
+    "ParallelAdmissionError",
+    "ParallelResult",
     "RLMModel",
     "RLMSpawnHandle",
     "RLMSubagent",
     "RefinementEvent",
+    "RlmAdmissionError",
+    "RlmAdmissionTransportError",
     "delete_subagent",
+    "expand_fanout",
+    "fanout",
+    "fanout_author",
     "find_models",
     "get_harness_state",
     "harness",
     "host_request",
     "list_subagents",
+    "parallel",
+    "parse_fanin",
     "rlm",
     "run",
 ]
