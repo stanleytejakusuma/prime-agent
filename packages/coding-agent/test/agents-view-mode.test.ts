@@ -525,6 +525,58 @@ describe("AgentsViewMode", () => {
 		expect(self.manualOrder).toEqual({});
 	});
 
+	it("wires manualOrder through the real reconcileCatalogs production path into emitted rows", () => {
+		// Closes the review gap left by unit tests that call buildAgentsViewRows()
+		// directly: this invokes the real reconcileCatalogs (no stub), the same
+		// method refreshSessions/refreshSavedSessions call in production, and
+		// asserts the manual pin actually reorders this.rows.
+		const older = summary({
+			id: "older",
+			activeSessionId: "older",
+			sessionId: "older-session",
+			sessionFile: "/tmp/older.jsonl",
+			lastActivityAt: "2026-01-01T00:00:00Z",
+		});
+		const newer = summary({
+			id: "newer",
+			activeSessionId: "newer",
+			sessionId: "newer-session",
+			sessionFile: "/tmp/newer.jsonl",
+			lastActivityAt: "2026-01-02T00:00:00Z",
+		});
+		const manualOrder = { idle: [getAgentsViewSummaryIdentity(older), getAgentsViewSummaryIdentity(newer)] };
+		const persistentState: AgentsViewPersistentState = { manualOrder };
+		const self: Record<string, unknown> = {
+			persistentState,
+			lastListedSummaries: [newer, older],
+			savedSessions: [],
+			heartbeats: [],
+			inactiveAgentIdentities: new Set(),
+			pendingDeleteAgent: undefined,
+			liveCatalogReady: true,
+			savedCatalogReady: true,
+			liveCatalogComplete: true,
+			savedCatalogComplete: true,
+			expandedSubagentParents: new Set(),
+			programShownParents: new Set(),
+			manualOrder,
+			editor: { getText: () => "" },
+			getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
+			applyPendingAncestorExpansion: vi.fn(),
+			restoreSelection: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			setStatusMessage: vi.fn(),
+			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+		};
+
+		invoke("reconcileCatalogs", self);
+
+		// Without the manual pin, heuristic ordering would surface `newer` first
+		// (more recent activity). The pin must win through the real production path.
+		const rows = Reflect.get(self, "rows") as AgentsViewRow[];
+		expect(rows.map((row) => row.summary.sessionId)).toEqual(["older-session", "newer-session"]);
+	});
+
 	it("carries the resolved scope root across view remounts", () => {
 		const root = summary({ sessionName: "Scoped root" });
 		const persistentState: AgentsViewPersistentState = {
@@ -1029,9 +1081,33 @@ describe("AgentsViewMode persistent catalog state", () => {
 		try {
 			await expect(invoke("refreshSessions", view, { preserveStatusOnError: true })).resolves.toBe(false);
 			expect(Reflect.get(view, "liveCatalogReady")).toBe(true);
+			// A failed payload is settled enough for scope fallback, but it never
+			// supplied the complete roster required for destructive pin pruning.
+			expect(Reflect.get(view, "liveCatalogComplete")).toBe(false);
 			expect(Reflect.get(view, "savedCatalogReady")).toBe(true);
 			expect(persistentState.scopeFrames).toEqual([{ scope, returnChat: root }]);
 			expect(persistentState.lastSuccessfulLiveSummaries).toEqual([root]);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("never marks the live catalog complete when the daemon returns a malformed session list", async () => {
+		// Distinct from the reject-path test above: client.request resolves
+		// successfully here, so the throw comes from response validation itself,
+		// which must run before liveCatalogComplete is set true, not after.
+		const persistentState = createInitialAgentsViewPersistentState({});
+		persistentState.lastSuccessfulSavedSessions = [];
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, persistentState);
+		Reflect.set(view, "client", {
+			isConnected: true,
+			request: vi.fn(async () => ({ success: true, data: { sessions: "not-an-array" } })),
+		});
+
+		try {
+			await expect(invoke("refreshSessions", view, { preserveStatusOnError: true })).resolves.toBe(false);
+			expect(Reflect.get(view, "liveCatalogReady")).toBe(true);
+			expect(Reflect.get(view, "liveCatalogComplete")).toBe(false);
 		} finally {
 			stopThemeWatcher();
 		}

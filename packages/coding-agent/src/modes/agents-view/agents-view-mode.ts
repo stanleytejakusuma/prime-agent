@@ -2218,9 +2218,13 @@ export class AgentsViewMode implements Component, Focusable {
 			try {
 				const response = await client.request(createAgentsViewListCommand());
 				if (generation !== this.liveCatalogGeneration) return false;
+				// Validate before marking the catalog complete: a malformed payload must
+				// leave liveCatalogComplete false (its reset value from function entry),
+				// never let a thrown validation error escape with the flag already true.
+				const sessions = expectSessionList(requireDaemonData(response));
 				this.liveCatalogReady = true;
 				this.liveCatalogComplete = true;
-				this.applySessionList(expectSessionList(requireDaemonData(response)), true);
+				this.applySessionList(sessions, true);
 				return true;
 			} catch (error) {
 				if (generation === this.liveCatalogGeneration) {
