@@ -252,3 +252,9 @@ git pull --rebase && git push
 ### User override
 
 If the user instructions conflict with rules set out here, ask for confirmation that they want to override the rules. Only then execute their instructions.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs for this repo live as GitHub issues on `stanleytejakusuma/prime-agent` (enabled 2026-08-21 specifically to support `/wayfinder`). See `docs/agents/issue-tracker.md`.
