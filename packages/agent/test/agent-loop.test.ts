@@ -4,6 +4,7 @@ import {
 	EventStream,
 	type Message,
 	type Model,
+	type ToolResultMessage,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -358,6 +359,290 @@ describe("agentLoop with AgentMessage", () => {
 		await stream.result();
 
 		expect(toolExecute).not.toHaveBeenCalled();
+	});
+
+	it("should not execute any tool calls from a length-truncated assistant message", async () => {
+		// Red HIGH fix: the length turn must include a schema-invalid call and an
+		// unknown tool so the test proves validation, lookup, and hooks are all
+		// skipped, not just happy-path execution. The local loop has no separate
+		// approval middleware; beforeToolCall is the hook closest to approval.
+		const toolSchema = Type.Object({ value: Type.String() });
+		const executed: string[] = [];
+		const beforeToolCall = vi.fn(async () => undefined);
+		const afterToolCall = vi.fn(async () => undefined);
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			beforeToolCall,
+			afterToolCall,
+		};
+
+		let callIndex = 0;
+		let sawSkippedResultsInNextRequest = false;
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, (_model, ctx) => {
+			if (callIndex === 1) {
+				const skippedResults = ctx.messages.filter(
+					(message): message is ToolResultMessage =>
+						message.role === "toolResult" && message.toolCallId.startsWith("truncated-"),
+				);
+				sawSkippedResultsInNextRequest =
+					skippedResults.length === 4 &&
+					skippedResults.every(
+						(message) =>
+							message.isError === true &&
+							message.content.some(
+								(block) => block.type === "text" && block.text.includes("output token limit"),
+							),
+					);
+			}
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					mockStream.push({
+						type: "done",
+						reason: "length",
+						message: createAssistantMessage(
+							[
+								{ type: "toolCall", id: "truncated-complete", name: "echo", arguments: { value: "complete" } },
+								{ type: "toolCall", id: "truncated-partial", name: "echo", arguments: { value: "partial" } },
+								// Schema-invalid: `value` is required but missing. The normal
+								// path would fail validation here; the guard must not even try.
+								{ type: "toolCall", id: "truncated-invalid", name: "echo", arguments: {} },
+								// Unknown tool: the normal path would error "not found".
+								{ type: "toolCall", id: "truncated-unknown", name: "no-such-tool", arguments: {} },
+							],
+							"length",
+						),
+					});
+				} else if (callIndex === 1) {
+					mockStream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[{ type: "toolCall", id: "reissued", name: "echo", arguments: { value: "complete" } }],
+							"toolUse",
+						),
+					});
+				} else {
+					mockStream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+				}
+				callIndex++;
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// Only the reissued call executes; hooks run only for it, never for the
+		// skipped calls (validation and lookup are also bypassed by construction).
+		expect(executed).toEqual(["complete"]);
+		expect(beforeToolCall).toHaveBeenCalledTimes(1);
+		expect(afterToolCall).toHaveBeenCalledTimes(1);
+		expect(sawSkippedResultsInNextRequest).toBe(true);
+		expect(callIndex).toBe(3);
+
+		const toolStarts = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_start" }> =>
+				event.type === "tool_execution_start",
+		);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		const skippedResults = events.flatMap((event) => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "toolResult" &&
+				event.message.toolCallId.startsWith("truncated-")
+			) {
+				return [event.message];
+			}
+			return [];
+		});
+
+		expect(toolStarts.map((event) => event.toolCallId)).toEqual([
+			"truncated-complete",
+			"truncated-partial",
+			"truncated-invalid",
+			"truncated-unknown",
+			"reissued",
+		]);
+		expect(toolEnds.map((event) => [event.toolCallId, event.isError])).toEqual([
+			["truncated-complete", true],
+			["truncated-partial", true],
+			["truncated-invalid", true],
+			["truncated-unknown", true],
+			["reissued", false],
+		]);
+		expect(skippedResults.map((result) => result.toolCallId)).toEqual([
+			"truncated-complete",
+			"truncated-partial",
+			"truncated-invalid",
+			"truncated-unknown",
+		]);
+		for (const result of skippedResults) {
+			expect(result.isError).toBe(true);
+			// The truncation-specific synthetic error, not a validation or
+			// unknown-tool error.
+			expect(
+				result.content.some((block) => block.type === "text" && block.text.includes("output token limit")),
+			).toBe(true);
+		}
+	});
+
+	it("should stop before a new model request when aborted after a length-truncated turn", async () => {
+		// Red MEDIUM fix: aborting after a length-stopped response is accepted
+		// must still emit the balanced synthetic events/results and must not start
+		// another model request.
+		const controller = new AbortController();
+		const toolSchema = Type.Object({ value: Type.String() });
+		const executed: string[] = [];
+		const beforeToolCall = vi.fn(async () => undefined);
+		const afterToolCall = vi.fn(async () => undefined);
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			beforeToolCall,
+			afterToolCall,
+		};
+
+		let callIndex = 0;
+		let requestStarts = 0;
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			config,
+			controller.signal,
+			(_model, _ctx) => {
+				requestStarts++;
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					if (callIndex === 0) {
+						mockStream.push({
+							type: "done",
+							reason: "length",
+							message: createAssistantMessage(
+								[
+									{ type: "toolCall", id: "truncated-1", name: "echo", arguments: { value: "a" } },
+									{ type: "toolCall", id: "truncated-2", name: "no-such-tool", arguments: {} },
+								],
+								"length",
+							),
+						});
+					} else {
+						// The loop must never reach here: the abort fires before the next
+						// model request, and throwIfAborted stops the loop at the top of
+						// the next iteration without calling streamFn again.
+						controller.abort();
+						mockStream.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessage([{ type: "text", text: "unreachable" }]),
+						});
+					}
+					callIndex++;
+				});
+				return mockStream;
+			},
+		);
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+			// Abort upon the accepted length-stopped assistant message, before
+			// the first synthetic tool_execution_start. The synthetic batch must
+			// still complete balanced, and no tool-path middleware or execution
+			// may run.
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "length"
+			) {
+				controller.abort();
+			}
+		}
+		expect(executed).toEqual([]);
+		expect(beforeToolCall).not.toHaveBeenCalled();
+		expect(afterToolCall).not.toHaveBeenCalled();
+		// Exactly one model request happened: the length-truncated turn. The
+		// abort prevented any subsequent request (counted synchronously at
+		// streamFn entry, not in the queued completion callback).
+		expect(requestStarts).toBe(1);
+		expect(callIndex).toBe(1);
+
+		const toolStarts = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_start" }> =>
+				event.type === "tool_execution_start",
+		);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolStarts.map((event) => event.toolCallId)).toEqual(["truncated-1", "truncated-2"]);
+		expect(toolEnds.map((event) => [event.toolCallId, event.isError])).toEqual([
+			["truncated-1", true],
+			["truncated-2", true],
+		]);
+		// The synthetic error results are emitted as message_end events, tied to
+		// the original call ids, even when the loop aborts right after.
+		const syntheticResults = events.flatMap((event) => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "toolResult" &&
+				event.message.toolCallId.startsWith("truncated-")
+			) {
+				return [event.message];
+			}
+			return [];
+		});
+		expect(syntheticResults.map((result) => result.toolCallId)).toEqual(["truncated-1", "truncated-2"]);
+		for (const result of syntheticResults) {
+			expect(result.isError).toBe(true);
+			expect(
+				result.content.some((block) => block.type === "text" && block.text.includes("output token limit")),
+			).toBe(true);
+		}
 	});
 
 	it("should stop a sequential tool batch after aborting a tool call", async () => {
