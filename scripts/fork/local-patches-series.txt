@@ -1,0 +1,27 @@
+# local-patches series file (PRD R2).
+#
+# Ordered list of branches that scripts/fork/sync-local-patches.mjs merges,
+# in this exact order, to deterministically rebuild local-patches from
+# main@<tag-or-ref>. One branch name per line. Lines starting with # and
+# blank lines are ignored.
+#
+# NEVER commit directly to local-patches. To change what ships, edit this
+# file (add/remove/reorder a line) or land a new commit on the named branch,
+# then re-run the sync script -- it always rebuilds local-patches from
+# scratch off the current base ref, it never incrementally merges onto an
+# existing local-patches tip.
+#
+# Order matters only for merge-conflict resolution ordering; git's ort
+# strategy has handled every conflict here so far without manual
+# intervention, but if two branches ever touch the same lines, whichever
+# merges first "wins" the ort auto-resolution and the later one may need a
+# manual conflict resolution pass.
+
+hardening/boot-gate
+fix/cwd-resume
+fix/timer-startedat
+fix/image-paste
+fix/ghost-sweep
+feat/sibling-doctrine
+feat/keybind-catalog
+hardening/secrets-scan
