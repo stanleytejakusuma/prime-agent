@@ -202,7 +202,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
-import { FooterComponent } from "./components/footer.js";
+import { FooterComponent, type FooterStatusLineData } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
@@ -1225,6 +1225,10 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
+		// Pi-style status line (fork feature): the footer renders lazily from
+		// client-local state on every invalidate(), so no per-event wiring is
+		// needed beyond the existing footer.invalidate() call sites.
+		this.footer.setStatusLineProvider(() => this.buildFooterStatusLine());
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -6238,6 +6242,24 @@ export class InteractiveMode {
 		this.sessionHasMessages = hasMessages;
 		this.builtInHeader?.invalidate();
 		this.subagentSummaryLine.invalidate();
+	}
+
+	private buildFooterStatusLine(): FooterStatusLineData | undefined {
+		const model = this.getCurrentModel();
+		if (!model) {
+			return undefined;
+		}
+		// Model, reasoning level, and context usage already live in the tray
+		// (getTrayLocationLabel / getTrayContextLabel, rendered just above the
+		// editor) -- this footer must not restate them or the same numbers show
+		// up twice on screen. It only carries data the tray does not already
+		// surface: current-turn tokens, git branch, and extension statuses.
+		const status = this.activityTracker.getStatus();
+		return {
+			turnTokens: status.tokens,
+			gitBranch: this.footerDataProvider.getGitBranch(),
+			extensionStatuses: this.footerDataProvider.getExtensionStatuses(),
+		};
 	}
 
 	private getModelTrayLabel(): string {
