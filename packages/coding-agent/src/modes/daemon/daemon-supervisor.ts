@@ -158,6 +158,8 @@ const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
 const STOP_FINALIZATION_RETRY_MS = 5000;
 const STALE_RECLAIM_WAIT_MS = 10_000;
+/** Rate limit for logging a repeatedly failing supervisor-state heartbeat write. */
+const SUPERVISOR_STATE_HEARTBEAT_FAILURE_LOG_COOLDOWN_MS = 30_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
 // supervisor event loop with synchronous subprocess spawns.
@@ -5579,13 +5581,35 @@ export class DaemonSupervisor {
 			this.supervisorState = record;
 			this.supervisorStateHeartbeatTimer = setInterval(() => {
 				if (this.supervisorState && !this.shuttingDown) {
-					touchSupervisorHeartbeat(this.supervisorState);
+					// Diagnostics must be strictly weaker than the thing they diagnose:
+					// an exception thrown here is an uncaught exception inside a timer
+					// callback (process-fatal), which would turn a transient journal
+					// write failure (disk full, socket dir removed) into exactly the
+					// supervisor-loss incident this journal exists to help recover
+					// from -- self-inflicted, once per second.
+					try {
+						touchSupervisorHeartbeat(this.supervisorState);
+					} catch (error) {
+						this.logSupervisorHeartbeatFailure(error);
+					}
 				}
 			}, SUPERVISOR_STATE_HEARTBEAT_MS);
 			this.supervisorStateHeartbeatTimer.unref?.();
 		} catch (error) {
 			this.log(`could not write supervisor state journal: ${String(error)}`);
 		}
+	}
+
+	private lastSupervisorHeartbeatFailureLogAt = 0;
+
+	/** Rate-limited so a sustained write failure cannot flood the log at 1 Hz. */
+	private logSupervisorHeartbeatFailure(error: unknown): void {
+		const now = Date.now();
+		if (now - this.lastSupervisorHeartbeatFailureLogAt < SUPERVISOR_STATE_HEARTBEAT_FAILURE_LOG_COOLDOWN_MS) {
+			return;
+		}
+		this.lastSupervisorHeartbeatFailureLogAt = now;
+		this.log(`supervisor state heartbeat write failed (will keep retrying): ${String(error)}`);
 	}
 
 	private async cleanupSupervisorResources(): Promise<void> {

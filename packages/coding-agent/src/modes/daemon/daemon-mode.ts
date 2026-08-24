@@ -360,7 +360,13 @@ const SUPERVISOR_FENCE_POLL_MS = 250;
 const SUPERVISOR_LAUNCH_COOLDOWN_MS = 15_000;
 // Upper bound a lock-holding worker waits for a hung-but-alive owner before
 // giving the lock back (the next election round then re-evaluates).
-const SUPERVISOR_HUNG_OWNER_WAIT_MS = 20_000;
+export const SUPERVISOR_HUNG_OWNER_WAIT_MS = 20_000;
+// If the owner stays "alive but unreachable" across repeated deferrals for
+// longer than this, indefinite quiet deferral becomes a worse failure mode
+// than the bounded churn the cooldown already caps: escalate and permit one
+// spawn attempt anyway, rather than deferring forever on an unverified
+// "socket lock is contested" inference.
+export const SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS = 3 * 60_000;
 // Loss diagnostics are logged at most this often per worker, on state changes
 // only, so a storm does not turn into a log storm.
 const SUPERVISOR_LOSS_LOG_COOLDOWN_MS = 30_000;
@@ -562,6 +568,8 @@ export class AgentDaemon {
 	private supervisorLaunchInProgress = false;
 	private supervisorLastLaunchAttemptAt = 0;
 	private supervisorLastLossLogAt = 0;
+	/** 0 when not currently in a hung-owner deferral streak; set on first defer. */
+	private supervisorHungOwnerDeferredSinceAt = 0;
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
@@ -965,6 +973,7 @@ export class AgentDaemon {
 				const waitDeadline = Date.now() + SUPERVISOR_HUNG_OWNER_WAIT_MS;
 				while (!this.shuttingDown && Date.now() < waitDeadline) {
 					if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+						this.supervisorHungOwnerDeferredSinceAt = 0;
 						return;
 					}
 					if (!this.supervisorOwnerAliveAndFresh(supervisorSocketPath)) {
@@ -973,11 +982,31 @@ export class AgentDaemon {
 					await delay(250);
 				}
 				if (this.supervisorOwnerAliveAndFresh(supervisorSocketPath)) {
+					if (this.supervisorHungOwnerDeferredSinceAt === 0) {
+						this.supervisorHungOwnerDeferredSinceAt = Date.now();
+					}
+					const deferredForMs = Date.now() - this.supervisorHungOwnerDeferredSinceAt;
+					if (deferredForMs < SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS) {
+						this.log(
+							`supervisor replacement deferred: owner alive but unreachable on ${supervisorSocketPath}; waiting for owner exit`,
+						);
+						return;
+					}
+					// The "fresh heartbeat implies a genuinely contested socket lock" is an
+					// unverified inference: it can also mean a listener died while its event
+					// loop (and heartbeat) kept running, in which case deferring forever is
+					// indefinite supervisor absence as a quiet steady state -- worse than the
+					// bounded churn SUPERVISOR_LAUNCH_COOLDOWN_MS already caps. Escalate to a
+					// warning and permit exactly one spawn attempt to fall through below; if
+					// the lock genuinely is held, this attempt is cheap (the very cooldown
+					// this deferral logic complements) and the owner keeps it either way.
 					this.log(
-						`supervisor replacement deferred: owner alive but unreachable on ${supervisorSocketPath}; waiting for owner exit`,
+						`supervisor replacement: owner alive but unreachable on ${supervisorSocketPath} for over ${Math.round(SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS / 1000)}s; escalating past deferral and attempting one spawn`,
 					);
-					return;
+					this.supervisorHungOwnerDeferredSinceAt = 0;
 				}
+			} else {
+				this.supervisorHungOwnerDeferredSinceAt = 0;
 			}
 			if (await isDaemonShutdownAdmissionActive()) {
 				return;

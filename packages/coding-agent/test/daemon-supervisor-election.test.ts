@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
+import { AgentDaemon, SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS } from "../src/modes/daemon/daemon-mode.js";
 import {
 	SUPERVISOR_STATE_FRESH_MS,
 	SUPERVISOR_STATE_HEARTBEAT_MS,
@@ -63,6 +63,7 @@ interface ElectionHarness {
 	checkSupervisorAvailability: (socketPath: string) => Promise<void>;
 	supervisorLastLaunchAttemptAt: number;
 	supervisorLaunchInProgress: boolean;
+	supervisorHungOwnerDeferredSinceAt: number;
 }
 
 function createHarness(socketPath: string, canConnect: () => Promise<boolean>): ElectionHarness {
@@ -74,6 +75,7 @@ function createHarness(socketPath: string, canConnect: () => Promise<boolean>): 
 		supervisorLaunchInProgress: false,
 		supervisorLastLaunchAttemptAt: 0,
 		supervisorLastLossLogAt: 0,
+		supervisorHungOwnerDeferredSinceAt: 0,
 		canConnectToSupervisor: vi.fn(canConnect),
 		log: vi.fn(),
 		scheduleSupervisorAvailabilityCheck: vi.fn(),
@@ -166,6 +168,52 @@ describe("supervisor replacement election (recovery storm hardening)", () => {
 		expect(harness.log.mock.calls.some((call) => String(call[0]).includes("supervisor replacement deferred"))).toBe(
 			true,
 		);
+	});
+
+	it("escalates past indefinite deferral and spawns once when the owner stays hung across the defer budget", async () => {
+		vi.useFakeTimers();
+		const socketPath = join(mkdtempSync(join(tmpdir(), "prime-supervisor-hung-escalate-sock-")), "daemon.sock");
+		// Same hung-owner shape as the deferral test above (fresh heartbeat, dead
+		// socket), but driven long enough to cross SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS.
+		// Without escalation this loops "defer" forever (B2): a listener that died
+		// while its event loop kept beating produces indefinite quiet absence
+		// instead of eventual recovery.
+		const record = freshStateRecord(socketPath);
+		writeSupervisorState(record);
+		const harness = createHarness(socketPath, async () => launchState.spawned.length > 0);
+
+		const launchPromise = harness.launchReplacementSupervisor(socketPath);
+		// Cross the defer budget across repeated hung-owner wait windows: each
+		// SUPERVISOR_HUNG_OWNER_WAIT_MS window ends in "still fresh" (since the
+		// journal is refreshed every heartbeat step below), so the method returns
+		// after deferring once. Drive checkSupervisorAvailability-style repeats by
+		// calling launchReplacementSupervisor again directly, accumulating deferred
+		// time via supervisorHungOwnerDeferredSinceAt across calls, exactly as
+		// production does across repeated availability-check rounds.
+		const totalSteps = Math.ceil(SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS / SUPERVISOR_STATE_HEARTBEAT_MS) + 25;
+		for (let step = 0; step < totalSteps; step += 1) {
+			writeSupervisorState(freshStateRecord(socketPath, { generation: record.generation }));
+			await vi.advanceTimersByTimeAsync(SUPERVISOR_STATE_HEARTBEAT_MS);
+		}
+		await launchPromise;
+
+		// The first deferral round returns without spawning; drive additional
+		// rounds (mirroring repeated checkSupervisorAvailability calls) until the
+		// accumulated deferred-since timestamp crosses the budget and one spawn
+		// attempt is made.
+		let rounds = 0;
+		while (launchState.spawned.length === 0 && rounds < 10) {
+			const roundPromise = harness.launchReplacementSupervisor(socketPath);
+			for (let step = 0; step < 90; step += 1) {
+				writeSupervisorState(freshStateRecord(socketPath, { generation: record.generation }));
+				await vi.advanceTimersByTimeAsync(SUPERVISOR_STATE_HEARTBEAT_MS);
+			}
+			await roundPromise;
+			rounds += 1;
+		}
+
+		expect(launchState.spawned).toHaveLength(1);
+		expect(harness.log.mock.calls.some((call) => String(call[0]).includes("escalating past deferral"))).toBe(true);
 	});
 
 	it("spawns promptly when the journal owner heartbeat is stale", async () => {
