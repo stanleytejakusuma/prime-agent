@@ -34,6 +34,7 @@ import {
 	resetApiProviders,
 	supportsFastMode,
 } from "@earendil-works/pi-ai";
+import { getAgentDir } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
@@ -218,6 +219,7 @@ import {
 	createRlmListSubagentsHostHandler,
 	createRlmRunHostHandler,
 	findRlmModelMatches,
+	normalizeRequestedRlmIsolation,
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	normalizeRequestedRlmSubagentThinkingLevel,
@@ -229,6 +231,7 @@ import {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import { type RlmWorktreeAdmission, RlmWorktreeLifecycleManager } from "./rlm-worktrees.js";
 import {
 	ActionStore,
 	type ActionTicket,
@@ -439,6 +442,11 @@ export interface AgentSessionConfig {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	/**
+	 * Root for opt-in worktree isolation. Defaults to <agentDir>/rlm-worktrees.
+	 * Exposed for tests and alternate agent data layouts.
+	 */
+	rlmWorktreeRoot?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	autonomous?: AgentAutonomousConfig;
 	prewarmIpythonKernel?: boolean;
@@ -1164,6 +1172,11 @@ export class AgentSession {
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, AgentSession>();
+	private _rlmWorktreeManager?: RlmWorktreeLifecycleManager;
+	private _rlmWorktreeRoot?: string;
+	// Per-child worktree admission until the lifecycle manager reaps it.
+	private _rlmWorktreeAdmissions = new Map<string, RlmWorktreeAdmission>();
+	private _rlmWorktreeFinalizes = new Map<string, Promise<void>>();
 	private _deletedRlmChildIds = new Set<string>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
@@ -1260,6 +1273,7 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		this._rlmWorktreeRoot = config.rlmWorktreeRoot;
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -1296,6 +1310,10 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+
+		// Adopt-or-reap runs after session state is loaded (the recovery barrier in
+		// the daemon path is worker adoption, which happens before sessions exist).
+		void this._reconcileRlmWorktreesOnStartup().catch(() => undefined);
 	}
 
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
@@ -4046,6 +4064,14 @@ export class AgentSession {
 		this._rlmChildSessions.clear();
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
+		// Session teardown reap: children are disposed above, so termination is
+		// confirmed; run the same pin-then-remove finalize path.
+		for (const [childId, admission] of [...this._rlmWorktreeAdmissions]) {
+			await this._finalizeRlmWorktreeChild(childId, admission).catch((error) =>
+				console.error(`[rlm-worktrees] teardown finalize failed for ${childId}: ${String(error)}`),
+			);
+		}
+		this._rlmWorktreeAdmissions.clear();
 		try {
 			await this._ipythonKernelProvisioner?.dispose();
 		} catch {
@@ -9255,6 +9281,85 @@ export class AgentSession {
 		return undefined;
 	}
 
+	private _rlmWorktreeLifecycle(): RlmWorktreeLifecycleManager {
+		if (!this._rlmWorktreeManager) {
+			this._rlmWorktreeManager = new RlmWorktreeLifecycleManager({
+				root: this._rlmWorktreeRoot ?? join(this._agentDir ?? getAgentDir(), "rlm-worktrees"),
+			});
+		}
+		return this._rlmWorktreeManager;
+	}
+
+	private _rlmWorktreeHandleMetadata(childId: string): Record<string, string> | undefined {
+		const admission = this._rlmWorktreeAdmissions.get(childId);
+		if (!admission) return undefined;
+		const metadata = this._rlmWorktreeLifecycle().getHandleMetadata(
+			admission.repoRoot,
+			admission.gitCommonDir,
+			this.sessionId,
+			childId,
+		);
+		if (!metadata) return undefined;
+		return {
+			isolation: metadata.isolation,
+			worktree_path: metadata.worktreePath,
+			worktree_branch: metadata.worktreeBranch,
+			worktree_status: metadata.worktreeStatus,
+			...(metadata.preservationRef ? { preservation_ref: metadata.preservationRef } : {}),
+		};
+	}
+
+	private _isRlmWorktreeChildLive(childId: string, childSessionDir: string): boolean {
+		const inRegistry = this._activeRlmChildRuns.has(childId) || this._rlmChildSessions.has(childId);
+		return inRegistry && existsSync(childSessionDir);
+	}
+
+	/** Finalize a worktree child after its run settled, it was deleted, or the parent disposed. */
+	private _finalizeRlmWorktreeChild(childId: string, admission: RlmWorktreeAdmission): Promise<void> {
+		const inFlight = this._rlmWorktreeFinalizes.get(childId);
+		if (inFlight) return inFlight;
+		const finalize = (async () => {
+			const result = await this._rlmWorktreeLifecycle().finalizeWorktree({
+				parentSessionId: this.sessionId,
+				childId,
+				repoRoot: admission.repoRoot,
+				gitCommonDir: admission.gitCommonDir,
+				// Every session-side call site finalizes only after the child settled,
+				// was deleted, or the parent disposed; termination is confirmed by
+				// construction. The manager's lsof check remains the hard backstop.
+				isChildLive: () => false,
+			});
+			if (result.outcome !== "cleanup_failed" && result.outcome !== "kept") {
+				this._rlmWorktreeAdmissions.delete(childId);
+			}
+		})();
+		this._rlmWorktreeFinalizes.set(childId, finalize);
+		void finalize
+			.catch(() => undefined)
+			.finally(() => {
+				if (this._rlmWorktreeFinalizes.get(childId) === finalize) {
+					this._rlmWorktreeFinalizes.delete(childId);
+				}
+			});
+		return finalize;
+	}
+
+	/** Adopt-or-reap for this session's namespace; runs once after construction. */
+	private async _reconcileRlmWorktreesOnStartup(): Promise<void> {
+		const manager = this._rlmWorktreeLifecycle();
+		if (!existsSync(manager.root)) return;
+		const identity = await manager.resolveRepoIdentity(this._cwd);
+		if (!identity) return;
+		const namespaceDir = manager.namespaceDirFor(identity.repoRoot, identity.gitCommonDir, this.sessionId);
+		if (!existsSync(namespaceDir)) return;
+		await manager.reconcileNamespace({
+			parentSessionId: this.sessionId,
+			repoRoot: identity.repoRoot,
+			gitCommonDir: identity.gitCommonDir,
+			isChildLive: (childId, childSessionDir) => this._isRlmWorktreeChildLive(childId, childSessionDir),
+		});
+	}
+
 	private _createChildRlmSessionDir(): string {
 		const parentDir = this._ensureRlmSessionDir() ?? this._createEphemeralRlmSessionDir();
 		for (let i = 0; i < 100; i++) {
@@ -9310,6 +9415,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
+		cwdOverride?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9318,6 +9424,7 @@ export class AgentSession {
 			sessionName: options.sessionName,
 			spawnCode: options.spawnCode,
 			sessionDir: options.sessionDir,
+			...(options.cwdOverride ? { cwdOverride: options.cwdOverride } : {}),
 			model: options.model,
 			thinkingLevel:
 				options.thinkingLevel ?? (clampThinkingLevel(options.model, this.thinkingLevel) as ThinkingLevel),
@@ -9344,7 +9451,8 @@ export class AgentSession {
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
-		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir);
+		const childCwd = options.cwdOverride ?? this._cwd;
+		const childSessionManager = SessionManager.create(childCwd, options.sessionDir);
 		if (options.parentSession.sessionFile) {
 			childSessionManager.newSession({
 				parentSession: options.parentSession.sessionFile,
@@ -9382,7 +9490,7 @@ export class AgentSession {
 			agent: childAgent,
 			sessionManager: childSessionManager,
 			settingsManager: this.settingsManager,
-			cwd: this._cwd,
+			cwd: childCwd,
 			agentDir: this._agentDir,
 			scopedModels: options.scopedModels,
 			resourceLoader: this._resourceLoader,
@@ -9500,6 +9608,7 @@ export class AgentSession {
 				session_name: daemonChild?.sessionName ?? run.session?.sessionName ?? run.sessionName,
 				session_dir: run.sessionDir,
 				status: run.status === "done" ? "completed" : run.status === "error" ? "error" : "running",
+				...(this._rlmWorktreeHandleMetadata(run.id) ?? {}),
 			});
 			recorded.add(run.id);
 		}
@@ -9524,6 +9633,7 @@ export class AgentSession {
 					daemonChild?.sessionName ?? childSession.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: sessionDir,
 				status: "completed",
+				...(this._rlmWorktreeHandleMetadata(childId) ?? {}),
 			});
 			recorded.add(childId);
 		}
@@ -9544,6 +9654,7 @@ export class AgentSession {
 				session_name: daemonChild.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: daemonChild.sessionDir,
 				status: daemonChild.rlmChildRegistryStatus === "completed" ? "completed" : "error",
+				...(this._rlmWorktreeHandleMetadata(childId) ?? {}),
 			});
 		}
 		return { subagents };
@@ -9757,6 +9868,12 @@ export class AgentSession {
 		run.settlement.resolve();
 		run.deletionReservation.resolve();
 		this._unsettledRlmChildRuns.delete(run);
+		const deletedAdmission = this._rlmWorktreeAdmissions.get(run.id);
+		if (deletedAdmission && !this._rlmChildSessions.has(run.id)) {
+			await this._finalizeRlmWorktreeChild(run.id, deletedAdmission).catch((error) =>
+				console.error(`[rlm-worktrees] finalize failed for ${run.id}: ${String(error)}`),
+			);
+		}
 		this._maybeResumeGoalContinuationAfterRlmWork();
 	}
 
@@ -9879,6 +9996,13 @@ export class AgentSession {
 				this._rlmChildCleanupFailures.set(childId, subagent);
 			}
 			throw error;
+		}
+		// The child runtime is disposed, so its worktree can be finalized now.
+		const retainedAdmission = this._rlmWorktreeAdmissions.get(childId);
+		if (retainedAdmission) {
+			await this._finalizeRlmWorktreeChild(childId, retainedAdmission).catch((error) =>
+				console.error(`[rlm-worktrees] finalize failed for ${childId}: ${String(error)}`),
+			);
 		}
 		this._deletedRlmChildIds.add(childId);
 		this._removeRlmSubagentTracking(childId);
@@ -10200,7 +10324,7 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
-		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
+		const { name: rawName, model: rawModel, thinking: rawThinking, isolation: rawIsolation, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
@@ -10208,6 +10332,7 @@ export class AgentSession {
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
 		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
+		const requestedIsolation = normalizeRequestedRlmIsolation(rawIsolation);
 		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
 		if (this._rlmDepth >= this._rlmMaxDepth) {
 			throw new Error(
@@ -10241,6 +10366,23 @@ export class AgentSession {
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+		let worktreeAdmission: RlmWorktreeAdmission | undefined;
+		if (requestedIsolation === "worktree") {
+			worktreeAdmission = await this._rlmWorktreeLifecycle().admitWorktree({
+				parentCwd: this._cwd,
+				parentSessionId: this.sessionId,
+				childId: childNodeId,
+				childSessionDir,
+			});
+			this._rlmWorktreeAdmissions.set(childNodeId, worktreeAdmission);
+		}
+		// Worktree notes are host-prepended before the caller prompt; the Python
+		// shim appends the FAN-IN block after it, so prompt order is notes, caller
+		// text, FAN-IN block.
+		const effectivePrompt =
+			worktreeAdmission && worktreeAdmission.notes.length > 0
+				? `${worktreeAdmission.notes.join("\n\n")}\n\n${prompt}`
+				: prompt;
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
@@ -10313,6 +10455,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				thinkingLevel: requestedThinkingLevel,
+				cwdOverride: worktreeAdmission?.cwdOverride,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -10430,7 +10573,7 @@ export class AgentSession {
 					}
 				});
 				run.unsubscribe = unsubscribeChildEvents;
-				const content = `[task from parent]\n\n${prompt}`;
+				const content = `[task from parent]\n\n${effectivePrompt}`;
 				const spawnMessage: AgentSessionMessage = {
 					role: "custom",
 					customType: AGENT_MESSAGE_CUSTOM_TYPE,
@@ -10580,16 +10723,27 @@ export class AgentSession {
 					run.settled = true;
 					run.settlement.resolve();
 					this._unsettledRlmChildRuns.delete(run);
+					// A worktree child whose session was NOT retained is terminally
+					// settled here; retained children are finalized on deletion or
+					// parent disposal instead (their runtime stays alive for reuse).
+					const settledAdmission = this._rlmWorktreeAdmissions.get(run.id);
+					if (settledAdmission && !this._rlmChildSessions.has(run.id)) {
+						void this._finalizeRlmWorktreeChild(run.id, settledAdmission).catch((error) =>
+							console.error(`[rlm-worktrees] finalize failed for ${run.id}: ${String(error)}`),
+						);
+					}
 					this._maybeResumeGoalContinuationAfterRlmWork();
 				}
 			}
 		})().catch(() => undefined);
 
+		const worktreeMetadata = worktreeAdmission ? this._rlmWorktreeHandleMetadata(childNodeId) : undefined;
 		return {
 			rlm_child_id: childNodeId,
 			name: sessionName,
 			session_dir: childSessionDir,
 			model: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+			...(worktreeMetadata ?? {}),
 		};
 	}
 

@@ -223,3 +223,62 @@ class RlmSubagentRegistryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RlmWorktreeRegistryFieldsTest(unittest.TestCase):
+    def test_lists_worktree_metadata_when_the_host_supplies_it(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "subagents": [
+                    {
+                        "rlm_child_id": "sub-a1b2c3d4",
+                        "active_session_id": "active-child",
+                        "session_id": "session-child",
+                        "session_name": "subagent-check-api-a1b2c3d4",
+                        "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                        "status": "running",
+                        "isolation": "worktree",
+                        "worktree_path": "/tmp/agent/rlm-worktrees/key/session/sub-a1b2c3d4",
+                        "worktree_branch": "refs/heads/rlm-wt/session/sub-a1b2c3d4",
+                        "preservation_ref": "refs/rlm-preserved/session/sub-a1b2c3d4",
+                        "worktree_status": "ACTIVE",
+                    }
+                ]
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            subagents = asyncio.run(rlm_module.rlm.list_subagents())
+
+        self.assertEqual(len(subagents), 1)
+        self.assertEqual(subagents[0].isolation, "worktree")
+        self.assertEqual(subagents[0].worktree_path, "/tmp/agent/rlm-worktrees/key/session/sub-a1b2c3d4")
+        self.assertEqual(subagents[0].worktree_branch, "refs/heads/rlm-wt/session/sub-a1b2c3d4")
+        self.assertEqual(subagents[0].preservation_ref, "refs/rlm-preserved/session/sub-a1b2c3d4")
+        self.assertEqual(subagents[0].worktree_status, "ACTIVE")
+
+    def test_omits_worktree_metadata_when_the_host_does_not_supply_it(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "subagents": [
+                    {
+                        "rlm_child_id": "sub-a1b2c3d4",
+                        "active_session_id": "active-child",
+                        "session_id": "session-child",
+                        "session_name": "subagent-check-api-a1b2c3d4",
+                        "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                        "status": "completed",
+                    }
+                ]
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            subagents = asyncio.run(rlm_module.rlm.list_subagents())
+
+        self.assertEqual(len(subagents), 1)
+        self.assertIsNone(subagents[0].isolation)
+        self.assertIsNone(subagents[0].worktree_path)
+        self.assertIsNone(subagents[0].worktree_branch)
+        self.assertIsNone(subagents[0].preservation_ref)
+        self.assertIsNone(subagents[0].worktree_status)
