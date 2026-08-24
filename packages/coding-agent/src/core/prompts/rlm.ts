@@ -49,6 +49,9 @@ const IPYTHON_CONTROL_PROMPT = [
 	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 ].join("\n");
 
+const SIBLING_REPLY_DOCTRINE_PROMPT =
+	'Sibling reply doctrine: when you receive an agent message from a sibling (a message with `receiver_role="sibling"`, including from another top-level session, since roots are siblings of each other) and the message asks a question or requests an answer, reply explicitly to the sender with `await agent_message.send(message, receiver_role="sibling", receiver_name="<sender session name>")` before ending the turn. The sender\'s identity is always present in the message envelope; do not rely on the sender following up. Not every message needs a reply: statements, status pings, and acknowledgments stay quiet. If replying requires work that outlives the turn, send a brief interim acknowledgment naming the expected delay, then send the real answer when it is ready. This closes the loop across sibling sessions the same way child agents already reply to their parent.';
+
 export interface ChildAgentDoctrineOptions {
 	depth?: number;
 	parentAgent?: string;
@@ -136,6 +139,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	if (hasAgentMessage) {
 		parts.push(
 			"Agent messaging is restricted to your parent, siblings, and direct children; roots are siblings, and deeper communication relays through the intermediate child.",
+			SIBLING_REPLY_DOCTRINE_PROMPT,
 		);
 	}
 	if (hasAgentObserve) {
