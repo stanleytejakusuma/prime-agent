@@ -1113,6 +1113,31 @@ describe("AgentsViewMode persistent catalog state", () => {
 		}
 	});
 
+	it("resets liveCatalogComplete if applySessionList itself throws after validation succeeds", async () => {
+		// Complements the malformed-payload test above: this proves the catch-path
+		// reset (R1), not just validation-before-flag-set. A valid payload passes
+		// expectSessionList, so liveCatalogComplete is set true, then
+		// applySessionList itself throws -- the catch must still reset the flag.
+		const persistentState = createInitialAgentsViewPersistentState({});
+		persistentState.lastSuccessfulSavedSessions = [];
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, persistentState);
+		Reflect.set(view, "client", {
+			isConnected: true,
+			request: vi.fn(async () => ({ success: true, data: { sessions: [] } })),
+		});
+		Reflect.set(view, "applySessionList", () => {
+			throw new Error("simulated post-validation failure");
+		});
+
+		try {
+			await expect(invoke("refreshSessions", view, { preserveStatusOnError: true })).resolves.toBe(false);
+			expect(Reflect.get(view, "liveCatalogReady")).toBe(true);
+			expect(Reflect.get(view, "liveCatalogComplete")).toBe(false);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
 	it("keeps a live-only scope after a fresh instance's first live poll fails", async () => {
 		const root = summary({
 			id: "root-active",

@@ -2229,8 +2229,12 @@ export class AgentsViewMode implements Component, Focusable {
 			} catch (error) {
 				if (generation === this.liveCatalogGeneration) {
 					// A completed failed attempt is still catalog-settled: otherwise a
-					// vanished scope can permanently trap an empty view.
+					// vanished scope can permanently trap an empty view. But it is never
+					// complete: this catch also covers applySessionList throwing after
+					// the flag was set true above, so unconditionally reset it here
+					// rather than assume the only throw site is validation.
 					this.liveCatalogReady = true;
+					this.liveCatalogComplete = false;
 					this.reconcileCatalogs();
 					if (!options.preserveStatusOnError && !this.reconnectPromise) {
 						if (client.isConnected) this.setStatusMessage(formatError("Failed to refresh agents", error));
