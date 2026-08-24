@@ -9,7 +9,8 @@
 // Usage: node scripts/fork/boot-verify.mjs <path-to-bundle-cli.js>
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const bundlePath = process.argv[2];
 if (!bundlePath) {
@@ -88,7 +89,14 @@ step("throwaway daemon starts and reports status", () => {
 //    together for no reason). Each marker is scoped to the branch that
 //    introduced it; when a branch is reverted, remove its markers too.
 step("bundle contains fork feature markers", () => {
-	const bundleText = readFileSync(bundlePath, "utf8");
+	// The esbuild output is split: cli.js is a small entry that imports the
+	// chunk files where the feature code actually lives. Scan every .js file
+	// under the bundle directory so a marker living in a chunk is not missed.
+	const bundleDir = dirname(bundlePath);
+	const bundleFiles = existsSync(bundleDir)
+		? readdirSync(bundleDir).filter((name) => name.endsWith(".js")).map((name) => join(bundleDir, name))
+		: [bundlePath];
+	const bundleText = bundleFiles.map((file) => readFileSync(file, "utf8")).join("\n");
 	const markers = [
 		"agents/resume", // chat tray hint (fork agents view navigation, feat/status-line-parity)
 		"session_usage_snapshot", // agents-view usage snapshot capability id (protocol 23, feat/agents-view-status-footer)
