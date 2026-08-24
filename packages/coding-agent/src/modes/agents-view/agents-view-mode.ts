@@ -66,11 +66,13 @@ import {
 	type StartupNotices,
 } from "../shared/startup-notices.js";
 import {
+	type AgentsViewManualOrder,
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
 	type AgentsViewScopeKey,
 	type AgentsViewSection,
 	type AgentsViewSelectionKey,
+	applyAgentsViewManualMove,
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
 	createUnattachableChildOpenResult,
@@ -83,6 +85,8 @@ import {
 	hasUnifiedSessionChildren,
 	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
+	migrateAgentsViewManualOrder,
+	pruneAgentsViewManualOrder,
 	reconcileUnifiedSessions,
 	resolveAgentsViewLeftResult,
 	resolveAgentsViewScopeFrames,
@@ -159,6 +163,10 @@ export type AgentsViewPersistentState = {
 	pendingExpandedAncestorSessionIds?: string[];
 	expandedSubagentParents?: Set<string>;
 	programShownParents?: Set<string>;
+	// Per-section manual pin order; seeded lazily and pruned only when a session
+	// no longer exists at all (see pruneAgentsViewManualOrder). Session-local
+	// only, same as the rest of this persistent state -- not written to disk.
+	manualOrder?: AgentsViewManualOrder;
 	statusMessage?: string;
 	// Gathered once and reused across agents-view instances so the notices survive
 	// re-entry and render the moment they resolve, even if the first view was left early.
@@ -660,6 +668,7 @@ export class AgentsViewMode implements Component, Focusable {
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
 	private programShownParents = new Set<string>();
+	private manualOrder: AgentsViewManualOrder = {};
 	private selectedIndex = 0;
 	private selectedRowIdentity: string | undefined;
 	private selectedActiveSessionId: string | undefined;
@@ -711,6 +720,8 @@ export class AgentsViewMode implements Component, Focusable {
 		persistentState.expandedSubagentParents = this.expandedSubagentParents;
 		this.programShownParents = persistentState.programShownParents ?? new Set();
 		persistentState.programShownParents = this.programShownParents;
+		this.manualOrder = persistentState.manualOrder ?? {};
+		persistentState.manualOrder = this.manualOrder;
 		this.keybindings = KeybindingsManager.create();
 		setKeybindings(this.keybindings);
 		setRegisteredThemes(options.uiServices.getThemes());
@@ -922,6 +933,30 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.program")) {
 			this.cycleProgramForSelected();
+			return;
+		}
+		if (
+			!this.replyTarget &&
+			this.editor.getText().length === 0 &&
+			this.keybindings.matches(data, "app.agents.moveEarlier")
+		) {
+			this.moveSelectedAgent("earlier");
+			return;
+		}
+		if (
+			!this.replyTarget &&
+			this.editor.getText().length === 0 &&
+			this.keybindings.matches(data, "app.agents.moveLater")
+		) {
+			this.moveSelectedAgent("later");
+			return;
+		}
+		if (
+			!this.replyTarget &&
+			this.editor.getText().length === 0 &&
+			this.keybindings.matches(data, "app.agents.resetOrder")
+		) {
+			this.resetSelectedAgentSectionOrder();
 			return;
 		}
 		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
@@ -1249,6 +1284,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
+			this.manualOrder,
 		);
 		const index =
 			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
@@ -1400,6 +1436,67 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		this.rebuildRows();
 		this.syncSelectedRowState();
+		this.ui.requestRender();
+	}
+
+	/**
+	 * Move the selected top-level agent row earlier/later within its section's
+	 * manual order. Guarded (see handleInput) to only fire on an empty search
+	 * box, matching the spec's decision to disable reordering while a filter
+	 * narrows the visible list rather than reorder against filtered adjacency.
+	 *
+	 * Runs entirely synchronously against `this.rows`, the state as of this
+	 * keypress -- there is no await between reading the selected row/section
+	 * and writing `this.manualOrder`, so there is no TOCTOU window for
+	 * `refreshSessions()` to change section membership or adjacency underneath
+	 * this move; a stale keypress simply cannot happen here.
+	 */
+	private moveSelectedAgent(direction: "earlier" | "later"): void {
+		const selected = this.rows[this.selectedIndex];
+		if (!selected || selected.kind !== "agent" || selected.depth !== 0) {
+			return;
+		}
+		const sectionAgents = this.rows.filter(
+			(row) => row.depth === 0 && row.kind === "agent" && row.section === selected.section,
+		);
+		const position = sectionAgents.findIndex((row) => row.identity === selected.identity);
+		if (position < 0) {
+			return;
+		}
+		const neighborPosition = direction === "earlier" ? position - 1 : position + 1;
+		const neighbor = sectionAgents[neighborPosition];
+		if (!neighbor) {
+			// Already first/last in its section: no-op per spec, no visual feedback
+			// beyond the existing dim/disabled convention.
+			return;
+		}
+		const displayOrder = sectionAgents.map((row) => row.identity);
+		const nextOrder = applyAgentsViewManualMove(
+			this.manualOrder[selected.section],
+			displayOrder,
+			selected.identity,
+			neighbor.identity,
+		);
+		this.manualOrder = { ...this.manualOrder, [selected.section]: nextOrder };
+		this.persistentState.manualOrder = this.manualOrder;
+		this.rebuildRows();
+		this.ui.requestRender();
+	}
+
+	/** Clear the manual order for the selected row's current section only. */
+	private resetSelectedAgentSectionOrder(): void {
+		const selected = this.rows[this.selectedIndex];
+		if (!selected || selected.kind !== "agent" || selected.depth !== 0) {
+			return;
+		}
+		if (!this.manualOrder[selected.section]) {
+			return;
+		}
+		const next = { ...this.manualOrder };
+		delete next[selected.section];
+		this.manualOrder = next;
+		this.persistentState.manualOrder = this.manualOrder;
+		this.rebuildRows();
 		this.ui.requestRender();
 	}
 
@@ -2154,6 +2251,12 @@ export class AgentsViewMode implements Component, Focusable {
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
+		this.manualOrder = migrateAgentsViewManualOrder(this.manualOrder, this.unifiedIndex.byKey);
+		this.manualOrder = pruneAgentsViewManualOrder(
+			this.manualOrder,
+			new Set(this.unifiedRecords.map((record) => record.identity)),
+		);
+		this.persistentState.manualOrder = this.manualOrder;
 
 		const frames = this.persistentState.scopeFrames ?? [];
 		const resolution = resolveAgentsViewScopeFrames(this.unifiedRecords, frames, this.unifiedIndex);
@@ -2173,6 +2276,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
+			this.manualOrder,
 		);
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
@@ -2664,6 +2768,9 @@ export class AgentsViewMode implements Component, Focusable {
 		const selectedAgent = selectedRow?.kind === "agent";
 		const selectedSubagent = selectedRow?.kind === "subagent";
 		const selectedSummary = selectedRow?.kind === "subagent-summary";
+		// Reordering is disabled while a search filter narrows the visible list
+		// (see moveSelectedAgent), so the hint only advertises it unfiltered.
+		const reorderAvailable = selectedAgent && this.editor.getText().length === 0;
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			selectedSummary
@@ -2682,6 +2789,9 @@ export class AgentsViewMode implements Component, Focusable {
 				? `${keyText("app.agents.delete")} ${selectedRow.section === "running" ? "stop" : "delete"}`
 				: undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
+			reorderAvailable
+				? `${keyText("app.agents.moveEarlier")}/${keyText("app.agents.moveLater")} reorder`
+				: undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");

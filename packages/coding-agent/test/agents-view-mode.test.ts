@@ -440,6 +440,7 @@ describe("AgentsViewMode", () => {
 			scopeKey: persistentState.scopeFrames?.[0]?.scope,
 			expandedSubagentParents: new Set(),
 			programShownParents: new Set(),
+			manualOrder: {},
 			editor: { getText: () => "" },
 			getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
 			applyPendingAncestorExpansion: vi.fn(),
@@ -495,6 +496,7 @@ describe("AgentsViewMode", () => {
 			scopeKey: persistentState.scopeFrames?.[0]?.scope,
 			expandedSubagentParents: new Set(),
 			programShownParents: new Set(),
+			manualOrder: {},
 			editor: { getText: () => "" },
 			getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
 			applyPendingAncestorExpansion: vi.fn(),
@@ -582,6 +584,7 @@ describe("AgentsViewMode", () => {
 				savedCatalogReady: true,
 				expandedSubagentParents,
 				programShownParents: new Set(),
+				manualOrder: {},
 				editor: { getText: () => "" },
 				getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
 				applyPendingAncestorExpansion: vi.fn(),
@@ -651,6 +654,252 @@ describe("AgentsViewMode", () => {
 		expect(expandedSubagentParents).toEqual(new Set(["root-row"]));
 		expect(programShownParents.size).toBe(0);
 		expect(self.rebuildRows).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("AgentsViewMode manual reorder", () => {
+	beforeAll(() => setKeybindings(new KeybindingsManager()));
+
+	function agentRow(overrides: Partial<AgentsViewRow> & { identity: string }): AgentsViewRow {
+		return {
+			kind: "agent",
+			section: "idle",
+			summary: summary({
+				id: overrides.identity,
+				activeSessionId: overrides.identity,
+				sessionId: overrides.identity,
+			}),
+			title: overrides.identity,
+			subtitle: "",
+			statusLabel: "",
+			depth: 0,
+			selectable: true,
+			runningSubagentCount: 0,
+			...overrides,
+		};
+	}
+
+	function subagentRow(identity: string, parentIdentity: string, section: AgentsViewRow["section"]): AgentsViewRow {
+		return {
+			kind: "subagent",
+			section,
+			summary: summary({ id: identity, activeSessionId: identity, sessionId: identity, runtimeKind: "subagent" }),
+			title: identity,
+			subtitle: "",
+			statusLabel: "",
+			depth: 1,
+			selectable: true,
+			runningSubagentCount: 0,
+			identity,
+			parentIdentity,
+		};
+	}
+
+	function moveHarness(rows: AgentsViewRow[], selectedIndex: number, manualOrder: Record<string, string[]> = {}) {
+		const self: Record<string, unknown> = {
+			rows,
+			selectedIndex,
+			manualOrder,
+			persistentState: {},
+			rebuildRows: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+		return self;
+	}
+
+	it("moves the selected agent earlier and swaps identities in manualOrder, seeded from current display order", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" }), agentRow({ identity: "c" })];
+		const self = moveHarness(rows, 1); // select "b"
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({ idle: ["b", "a", "c"] });
+		expect(self.rebuildRows).toHaveBeenCalledOnce();
+		expect((self.persistentState as { manualOrder?: unknown }).manualOrder).toBe(self.manualOrder);
+	});
+
+	it("moves the selected agent later and swaps identities in manualOrder", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" }), agentRow({ identity: "c" })];
+		const self = moveHarness(rows, 1); // select "b"
+
+		invoke("moveSelectedAgent", self, "later");
+
+		expect(self.manualOrder).toEqual({ idle: ["a", "c", "b"] });
+	});
+
+	it("is a no-op at the top of the section (shift/alt+up on the first row)", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" })];
+		const self = moveHarness(rows, 0); // select "a", already first
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("is a no-op at the bottom of the section (alt+down on the last row)", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" })];
+		const self = moveHarness(rows, 1); // select "b", already last
+
+		invoke("moveSelectedAgent", self, "later");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("skips nested subagent rows and lands the swap on the next top-level agent row", () => {
+		// a (agent) / a's subagent (nested) / b (agent): moving b earlier must
+		// swap with a, not with a's nested subagent row.
+		const rows = [agentRow({ identity: "a" }), subagentRow("a-child", "a", "idle"), agentRow({ identity: "b" })];
+		const self = moveHarness(rows, 2); // select "b"
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({ idle: ["b", "a"] });
+	});
+
+	it("only reorders within the selected row's own section", () => {
+		const rows = [
+			agentRow({ identity: "running-a", section: "running" }),
+			agentRow({ identity: "idle-a", section: "idle" }),
+			agentRow({ identity: "idle-b", section: "idle" }),
+		];
+		const self = moveHarness(rows, 2); // select idle-b
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({ idle: ["idle-b", "idle-a"] });
+	});
+
+	it("does not move a subagent row or a nested-summary row (top-level agent rows only)", () => {
+		const rows = [agentRow({ identity: "a" }), subagentRow("a-child", "a", "idle")];
+		const self = moveHarness(rows, 1); // select the subagent row
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("TOCTOU: no-ops when the selected row disappeared from `rows` before the keypress applied", () => {
+		// Simulates a refreshSessions() landing between the keypress being queued
+		// and moveSelectedAgent running: selectedIndex points past the end of a
+		// now-shorter rows array.
+		const rows = [agentRow({ identity: "a" })];
+		const self = moveHarness(rows, 5);
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("resets manual order for only the selected row's section", () => {
+		const rows = [agentRow({ identity: "a", section: "idle" }), agentRow({ identity: "b", section: "running" })];
+		const self = moveHarness(rows, 0, { idle: ["active:z"], running: ["active:y"] });
+
+		invoke("resetSelectedAgentSectionOrder", self);
+
+		expect(self.manualOrder).toEqual({ running: ["active:y"] });
+		expect(self.rebuildRows).toHaveBeenCalledOnce();
+	});
+
+	it("reset is a no-op when the selected section has no manual order", () => {
+		const rows = [agentRow({ identity: "a", section: "idle" })];
+		const self = moveHarness(rows, 0, { running: ["active:y"] });
+
+		invoke("resetSelectedAgentSectionOrder", self);
+
+		expect(self.manualOrder).toEqual({ running: ["active:y"] });
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("handleInput dispatches app.agents.moveEarlier/moveLater/resetOrder only with an empty search box and no active reply", () => {
+		const moveSelectedAgent = vi.fn();
+		const resetSelectedAgentSectionOrder = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: undefined,
+			editor: { getText: () => "" },
+			keybindings: {
+				matches: (_d: string, action: string) =>
+					action === "app.agents.moveEarlier" ||
+					action === "app.agents.moveLater" ||
+					action === "app.agents.resetOrder",
+			},
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			resetSelectedAgentSectionOrder,
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A"); // alt+up
+		expect(moveSelectedAgent).toHaveBeenCalledWith("earlier");
+	});
+
+	it("handleInput does not dispatch reorder while the search box has text (filter active)", () => {
+		const moveSelectedAgent = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: undefined,
+			editor: { getText: () => "filtering", handleInput: vi.fn() },
+			keybindings: {
+				matches: (_d: string, action: string) => action === "app.agents.moveEarlier",
+			},
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			handleListNavigation: vi.fn(() => false),
+			queryChanged: vi.fn(),
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A");
+		expect(moveSelectedAgent).not.toHaveBeenCalled();
+	});
+
+	it("handleInput does not dispatch reorder while a reply composer is armed", () => {
+		const moveSelectedAgent = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor: { getText: () => "", handleInput: vi.fn() },
+			keybindings: {
+				matches: (_d: string, action: string) => action === "app.agents.moveEarlier",
+			},
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			handleListNavigation: vi.fn(() => false),
+			queryChanged: vi.fn(),
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A");
+		expect(moveSelectedAgent).not.toHaveBeenCalled();
+	});
+
+	it("renderHints shows the reorder hint only for a top-level agent row with an empty search box", () => {
+		const buildSelf = (row: AgentsViewRow | undefined, queryText: string) => ({
+			isCtrlCExitHintVisible: () => false,
+			statusMessage: undefined,
+			renameTarget: undefined,
+			replyTarget: undefined,
+			rows: row ? [row] : [],
+			selectedIndex: 0,
+			editor: { getText: () => queryText },
+			selectedRowCanShowProgram: () => false,
+		});
+
+		const agentHints = invoke("renderHints", buildSelf(agentRow({ identity: "a" }), ""), 200) as string;
+		expect(agentHints).toContain("reorder");
+
+		const filteredHints = invoke("renderHints", buildSelf(agentRow({ identity: "a" }), "query"), 200) as string;
+		expect(filteredHints).not.toContain("reorder");
+
+		const subagentHints = invoke("renderHints", buildSelf(subagentRow("a-child", "a", "idle"), ""), 200) as string;
+		expect(subagentHints).not.toContain("reorder");
 	});
 });
 
