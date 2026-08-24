@@ -204,6 +204,41 @@ describe("buildRlmPrompt", () => {
 
 		expect(withoutEdit).not.toContain("await edit(path=");
 	});
+
+	test("includes the sibling reply doctrine only when agent_message is installed", () => {
+		const withAgentMessage = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			installedSkills: ["agent_message"],
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+		expect(withAgentMessage).toContain("Sibling reply doctrine");
+		expect(withAgentMessage).toContain('receiver_role="sibling"');
+		expect(withAgentMessage).toContain("reply explicitly to the sender");
+
+		const withoutAgentMessage = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+		expect(withoutAgentMessage).not.toContain("Sibling reply doctrine");
+	});
+
+	test("states the sibling reply doctrine applies to root sessions, not only spawned children", () => {
+		const rootPrompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			installedSkills: ["agent_message"],
+			activeTools: ["ipython"],
+			allowRecursion: false,
+			depth: 0,
+		});
+
+		expect(rootPrompt).toContain("Sibling reply doctrine");
+		expect(rootPrompt).toContain("since roots are siblings of each other");
+	});
 });
 
 describe("buildSystemPrompt", () => {
