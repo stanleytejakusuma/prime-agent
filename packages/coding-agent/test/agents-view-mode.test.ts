@@ -1237,6 +1237,43 @@ describe("AgentsViewMode persistent catalog state", () => {
 		}
 	});
 
+	it("repaints on every failed reconnect retry tick, not just at the start or end (trust capsule liveness)", async () => {
+		// Red review 2026-08-24: without a render on every retry tick, the footer
+		// (including the trust capsule) can freeze on its pre-outage state for the
+		// entire reconnect window, since neither setStatusMessage's timeout-exit
+		// call (render: false) nor the retry loop itself previously requested a
+		// render between attempts.
+		vi.useFakeTimers();
+		const persistentState: AgentsViewPersistentState = {};
+		const view = new AgentsViewMode(
+			{ config: {}, uiServices: createUiServices(), reconnectTimeoutMs: 10_000 },
+			persistentState,
+		);
+		const client = {
+			isConnected: false,
+			reconnect: vi.fn(async () => {
+				throw new Error("still down");
+			}),
+		};
+		Reflect.set(view, "client", client);
+		const ui = Reflect.get(view, "ui") as { requestRender: () => void };
+		const renderSpy = vi.spyOn(ui, "requestRender");
+
+		try {
+			const reconnecting = invoke("reconnectClient", view, client, new Error("disconnected")) as Promise<void>;
+			renderSpy.mockClear();
+			// Advance past several failed retry ticks, well before the 10s deadline.
+			await vi.advanceTimersByTimeAsync(1000 * 3 + 50); // RECONNECT_RETRY_MS is module-private; mirror its value
+			expect(renderSpy.mock.calls.length).toBeGreaterThanOrEqual(3);
+
+			// Let it run to the deadline so the promise settles cleanly.
+			await vi.advanceTimersByTimeAsync(15_000);
+			await reconnecting;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("keeps a newly pushed scope and the existing live cache when its first poll fails", async () => {
 		const root = summary();
 		const other = summary({ id: "other-active", activeSessionId: "other-active", sessionId: "other-session" });

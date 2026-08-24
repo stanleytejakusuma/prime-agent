@@ -294,6 +294,67 @@ describe("control-plane trust capsule (line 2)", () => {
 		).map(stripAnsi);
 		expect(stale[1]).not.toMatch(/^D\u2713/);
 	});
+
+	it("treats a negative or non-finite age as unknown, never as healthy (clock-rollback safety)", () => {
+		// Red review 2026-08-24: Date.now() - earlierStamp can go negative across
+		// a backward wall-clock adjustment. A negative or non-finite age must
+		// render "D?" (unknown), never "D\u2713" (healthy) or a garbage value like
+		// "D\u2713 NaNs".
+		for (const badAge of [-1, -30_000, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+			const lines = buildAgentsViewStatusLines(
+				{
+					summary: undefined,
+					countsText: "0 running, 0 idle, 0 inactive",
+					scopeLabel: "global",
+					depth: 0,
+					daemonFrameAgeMs: badAge,
+				},
+				120,
+			).map(stripAnsi);
+			expect(lines[1]).toMatch(/^D\?/);
+			expect(lines[1]).not.toContain("NaN");
+			expect(lines[1]).not.toMatch(/^D\u2713/);
+			expect(lines[1]).not.toMatch(/^D!/);
+		}
+	});
+
+	it("renders boundary ages correctly: just under, at, and just over the stale threshold", () => {
+		const justUnder = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "0 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 2999,
+			},
+			120,
+		).map(stripAnsi);
+		expect(justUnder[1]).toMatch(/^D\u2713/);
+
+		const atThreshold = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "0 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 3000,
+			},
+			120,
+		).map(stripAnsi);
+		expect(atThreshold[1]).toMatch(/^D\u2713/);
+
+		const justOver = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "0 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 3001,
+			},
+			120,
+		).map(stripAnsi);
+		expect(justOver[1]).toMatch(/^D! STALE/);
+	});
 });
 
 describe("git branch cache", () => {

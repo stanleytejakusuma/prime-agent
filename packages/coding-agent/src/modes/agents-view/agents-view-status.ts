@@ -198,29 +198,37 @@ function buildUsageLine(usage: SessionUsageSnapshot): string {
 }
 
 /**
- * Build the three-line agents-view status footer. Always returns exactly
- * three lines (a blank dim placeholder fills a slot with nothing to show),
- * so dock height never varies with selection or data availability. Pure and
- * synchronous: reads the module-level branch cache (see peekCachedGitBranch)
- * instead of resolving a branch itself.
- */
-/**
  * Control-plane trust capsule (Red inspiration 2026-08-24). Leftmost element
  * of line 2. If the daemon feed is stale or misdecoded, every other footer
  * value can look plausible while being wrong, so the capsule is the first
  * thing the eye should hit. Missing data renders as unknown, never healthy.
+ *
+ * "Uncertain" (Red review 2026-08-24) includes undefined (no frame decoded
+ * yet), non-finite values, and negative ages (a backward wall-clock
+ * adjustment between the stamp and this render): all three fall to "D?",
+ * never to the healthy "D\u2713" state. The threshold is tied to
+ * POLL_INTERVAL_MS (agents-view-mode.ts, 1000ms): roughly three missed poll
+ * cycles under normal low-latency conditions, not an exact failed-attempt
+ * count (attempt count is not tracked here).
  */
 function renderDaemonTrustCapsule(ageMs: number | undefined): string {
-	if (ageMs === undefined) {
+	if (ageMs === undefined || !Number.isFinite(ageMs) || ageMs < 0) {
 		return "D?";
 	}
-	const seconds = Math.max(0, Math.floor(ageMs / 1000));
+	const seconds = Math.floor(ageMs / 1000);
 	if (ageMs > DAEMON_FRAME_STALE_MS) {
 		return `D! STALE ${seconds}s`;
 	}
 	return `D\u2713 ${seconds}s`;
 }
 
+/**
+ * Build the three-line agents-view status footer. Always returns exactly
+ * three lines (a blank dim placeholder fills a slot with nothing to show),
+ * so dock height never varies with selection or data availability. Pure and
+ * synchronous: reads the module-level branch cache (see peekCachedGitBranch)
+ * instead of resolving a branch itself.
+ */
 export function buildAgentsViewStatusLines(data: AgentsViewStatusLineData, width: number): string[] {
 	const safeWidth = Math.max(1, width);
 	const summary = data.summary;

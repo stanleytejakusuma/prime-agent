@@ -2599,6 +2599,13 @@ export class AgentsViewMode implements Component, Focusable {
 			} catch (error) {
 				lastError = error;
 			}
+			// Red review 2026-08-24 (trust capsule): without a render on every retry
+			// tick, the footer (including the trust capsule) can freeze on its
+			// pre-outage state for the whole reconnect window (up to
+			// RECONNECT_TIMEOUT_MS) even though the daemon has been unreachable
+			// the entire time. Repaint so the capsule's displayed age keeps
+			// advancing and eventually crosses into stale.
+			this.ui.requestRender();
 			await new Promise<void>((resolve) => {
 				const retryTimer = setTimeout(resolve, RECONNECT_RETRY_MS);
 				retryTimer.unref?.();
