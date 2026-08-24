@@ -5609,7 +5609,13 @@ export class DaemonSupervisor {
 			return;
 		}
 		this.lastSupervisorHeartbeatFailureLogAt = now;
-		this.log(`supervisor state heartbeat write failed (will keep retrying): ${String(error)}`);
+		try {
+			this.log(`supervisor state heartbeat write failed (will keep retrying): ${String(error)}`);
+		} catch {
+			// The logging path can fail in the same disk-failure scenario that broke
+			// the heartbeat write. Diagnostics must be total: never let the failure
+			// logger itself throw back into the timer callback.
+		}
 	}
 
 	private async cleanupSupervisorResources(): Promise<void> {
@@ -5627,7 +5633,14 @@ export class DaemonSupervisor {
 			this.supervisorStateHeartbeatTimer = undefined;
 		}
 		if (this.supervisorState) {
-			markSupervisorExited(this.socketPath, this.supervisorState, "cleanup");
+			try {
+				markSupervisorExited(this.socketPath, this.supervisorState, "cleanup");
+			} catch (error) {
+				// A rename/write failure during shutdown on a broken disk must not
+				// strand the remaining cleanup steps (eviction timer, signal
+				// handlers, socket/lock release).
+				this.log(`could not mark supervisor exited: ${String(error)}`);
+			}
 		}
 		this.clearIdleEvictionTimer();
 		await this.idleEvictionSweep?.catch(() => undefined);

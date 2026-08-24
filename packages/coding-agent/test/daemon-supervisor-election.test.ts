@@ -216,6 +216,59 @@ describe("supervisor replacement election (recovery storm hardening)", () => {
 		expect(harness.log.mock.calls.some((call) => String(call[0]).includes("escalating past deferral"))).toBe(true);
 	});
 
+	it("resets the deferral streak on recovery so a second incident defers again instead of escalating early", async () => {
+		// Red review 2026-08-24 (supervisor recovery final re-review), R1: before
+		// this fix, supervisorHungOwnerDeferredSinceAt was only reset on
+		// reconnect-inside-wait / stale-owner / post-escalation, NOT on the normal
+		// recovery path (a successful canConnectToSupervisor at the top of
+		// checkSupervisorAvailability). Incident 1 set the streak clock; the
+		// supervisor recovered via a normal availability check; the clock stayed
+		// stale; incident 2 then escalated immediately, skipping the entire
+		// damping window. This regression drives exactly that two-incident shape.
+		vi.useFakeTimers();
+		const socketPath = join(mkdtempSync(join(tmpdir(), "prime-supervisor-r1-recover-sock-")), "daemon.sock");
+		const record = freshStateRecord(socketPath);
+		writeSupervisorState(record);
+
+		// Incident 1: owner is hung (fresh heartbeat, dead socket). The worker
+		// defers once, setting the streak clock.
+		let connected = false;
+		const harness = createHarness(socketPath, async () => connected);
+		const firstRound = harness.launchReplacementSupervisor(socketPath);
+		for (let step = 0; step < 22; step += 1) {
+			writeSupervisorState(freshStateRecord(socketPath, { generation: record.generation }));
+			await vi.advanceTimersByTimeAsync(SUPERVISOR_STATE_HEARTBEAT_MS);
+		}
+		await firstRound;
+		expect(launchState.spawned).toHaveLength(0);
+		expect(harness.supervisorHungOwnerDeferredSinceAt).toBeGreaterThan(0);
+
+		// Recovery: the supervisor's socket comes back (as if the hang cleared).
+		// A normal availability check must reset the streak clock.
+		connected = true;
+		await harness.checkSupervisorAvailability(socketPath);
+		expect(harness.supervisorHungOwnerDeferredSinceAt).toBe(0);
+
+		// Incident 2, much later: hung again. The first round must defer (fresh
+		// damping budget), NOT escalate immediately on the stale streak clock.
+		connected = false;
+		// launchReplacementSupervisor is called directly here (bypassing the
+		// availability-check cooldown gate, which is a separate concern); no
+		// cooldown advance is needed.
+		const secondRound = harness.launchReplacementSupervisor(socketPath);
+		for (let step = 0; step < 22; step += 1) {
+			writeSupervisorState(freshStateRecord(socketPath, { generation: record.generation }));
+			await vi.advanceTimersByTimeAsync(SUPERVISOR_STATE_HEARTBEAT_MS);
+		}
+		await secondRound;
+
+		expect(launchState.spawned).toHaveLength(0);
+		expect(harness.log.mock.calls.some((call) => String(call[0]).includes("supervisor replacement deferred"))).toBe(
+			true,
+		);
+		expect(harness.log.mock.calls.some((call) => String(call[0]).includes("escalating past deferral"))).toBe(false);
+	});
+
 	it("spawns promptly when the journal owner heartbeat is stale", async () => {
 		const socketPath = join(mkdtempSync(join(tmpdir(), "prime-supervisor-stalehb-sock-")), "daemon.sock");
 		const stale = freshStateRecord(socketPath, {

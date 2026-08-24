@@ -768,6 +768,11 @@ export class AgentDaemon {
 			return;
 		}
 		if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+			// Recovery from a hang manifests as a successful connect on a later
+			// availability check. Reset the deferral streak here so the next
+			// incident starts with a full damping budget instead of escalating
+			// immediately on a stale streak timestamp.
+			this.supervisorHungOwnerDeferredSinceAt = 0;
 			return;
 		}
 		this.reportSupervisorLoss(supervisorSocketPath);
@@ -796,18 +801,22 @@ export class AgentDaemon {
 			return;
 		}
 		this.supervisorLastLossLogAt = now;
-		const state = readSupervisorState(supervisorSocketPath);
-		const facts = state
-			? [
-					`pid=${state.pid}`,
-					`generation=${state.generation}`,
-					`startedAt=${state.startedAt}`,
-					`heartbeatAgeMs=${Math.round(now - Date.parse(state.lastHeartbeatAt))}`,
-					`processAlive=${this.isProcessAlive(state.pid)}`,
-					`exited=${state.exitReason ?? "none"}`,
-				].join(" ")
-			: "no supervisor state journal (older supervisor build or journal write failed)";
-		this.log(`supervisor loss detected on ${supervisorSocketPath}: ${facts}`);
+		try {
+			const state = readSupervisorState(supervisorSocketPath);
+			const facts = state
+				? [
+						`pid=${state.pid}`,
+						`generation=${state.generation}`,
+						`startedAt=${state.startedAt}`,
+						`heartbeatAgeMs=${Math.round(now - Date.parse(state.lastHeartbeatAt))}`,
+						`processAlive=${this.isProcessAlive(state.pid)}`,
+						`exited=${state.exitReason ?? "none"}`,
+					].join(" ")
+				: "no supervisor state journal (older supervisor build or journal write failed)";
+			this.log(`supervisor loss detected on ${supervisorSocketPath}: ${facts}`);
+		} catch {
+			// Diagnostics must never throw into the availability-check chain.
+		}
 	}
 
 	/**
@@ -1008,6 +1017,11 @@ export class AgentDaemon {
 			} else {
 				this.supervisorHungOwnerDeferredSinceAt = 0;
 			}
+			// Any path that reaches the spawn (stale owner mid-wait, escalated past
+			// budget, or no fresh owner at entry) means the hung-owner condition no
+			// longer holds right now; reset the streak so the next incident starts
+			// with a fresh damping budget.
+			this.supervisorHungOwnerDeferredSinceAt = 0;
 			if (await isDaemonShutdownAdmissionActive()) {
 				return;
 			}
