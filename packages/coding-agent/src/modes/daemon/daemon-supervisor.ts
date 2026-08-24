@@ -108,6 +108,13 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
+import {
+	markSupervisorExited,
+	SUPERVISOR_STATE_HEARTBEAT_MS,
+	type SupervisorStateRecord,
+	touchSupervisorHeartbeat,
+	writeSupervisorState,
+} from "./daemon-supervisor-state.js";
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -663,6 +670,8 @@ export class DaemonSupervisor {
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
 	private idleEvictionSweep?: Promise<void>;
 	private idleEvictionFence?: Promise<void>;
+	private supervisorState?: SupervisorStateRecord;
+	private supervisorStateHeartbeatTimer?: ReturnType<typeof setInterval>;
 
 	constructor(
 		private readonly socketPath: string,
@@ -761,6 +770,7 @@ export class DaemonSupervisor {
 			this.scheduleIdleEvictionSweep();
 			await this.ownership.updatePhase("owner");
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
+			this.startSupervisorStateJournal();
 			this.markReady();
 		} catch (error) {
 			const startupError = error instanceof Error ? error : new Error(String(error));
@@ -5546,6 +5556,38 @@ export class DaemonSupervisor {
 		cleanupDaemonSocketPath(this.socketPath, identity, this.socketLease);
 	}
 
+	/**
+	 * Durable lifecycle journal for supervisor-loss triage and deterministic
+	 * worker election. The record is written once startup is listening, then
+	 * heartbeated every second so workers can distinguish a dead supervisor
+	 * (stale heartbeat, pid gone) from a hung one (fresh heartbeat, dead
+	 * socket) and so every disappearance has a last-known identity.
+	 */
+	private startSupervisorStateJournal(): void {
+		try {
+			const record: SupervisorStateRecord = {
+				version: 1,
+				pid: process.pid,
+				processStartId: getProcessStartId(process.pid),
+				generation: this.generation,
+				socketPath: this.socketPath,
+				appVersion: VERSION,
+				startedAt: new Date().toISOString(),
+				lastHeartbeatAt: new Date().toISOString(),
+			};
+			writeSupervisorState(record);
+			this.supervisorState = record;
+			this.supervisorStateHeartbeatTimer = setInterval(() => {
+				if (this.supervisorState && !this.shuttingDown) {
+					touchSupervisorHeartbeat(this.supervisorState);
+				}
+			}, SUPERVISOR_STATE_HEARTBEAT_MS);
+			this.supervisorStateHeartbeatTimer.unref?.();
+		} catch (error) {
+			this.log(`could not write supervisor state journal: ${String(error)}`);
+		}
+	}
+
 	private async cleanupSupervisorResources(): Promise<void> {
 		if (this.cleanupPromise) {
 			return this.cleanupPromise;
@@ -5556,6 +5598,13 @@ export class DaemonSupervisor {
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
+		if (this.supervisorStateHeartbeatTimer) {
+			clearInterval(this.supervisorStateHeartbeatTimer);
+			this.supervisorStateHeartbeatTimer = undefined;
+		}
+		if (this.supervisorState) {
+			markSupervisorExited(this.socketPath, this.supervisorState, "cleanup");
+		}
 		this.clearIdleEvictionTimer();
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
