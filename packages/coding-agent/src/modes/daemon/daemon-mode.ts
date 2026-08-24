@@ -186,6 +186,7 @@ import {
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
+import { readSupervisorState, SUPERVISOR_STATE_FRESH_MS } from "./daemon-supervisor-state.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -353,6 +354,22 @@ const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SUPPORT
 const CLIENT_CATCHUP_RETRY_MS = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
 const SUPERVISOR_FENCE_POLL_MS = 250;
+// A worker never spawns a replacement supervisor more often than this, even if
+// the socket stays unreachable; the winner holds the election lock and the
+// losers wait instead of churning the process table.
+const SUPERVISOR_LAUNCH_COOLDOWN_MS = 15_000;
+// Upper bound a lock-holding worker waits for a hung-but-alive owner before
+// giving the lock back (the next election round then re-evaluates).
+export const SUPERVISOR_HUNG_OWNER_WAIT_MS = 20_000;
+// If the owner stays "alive but unreachable" across repeated deferrals for
+// longer than this, indefinite quiet deferral becomes a worse failure mode
+// than the bounded churn the cooldown already caps: escalate and permit one
+// spawn attempt anyway, rather than deferring forever on an unverified
+// "socket lock is contested" inference.
+export const SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS = 3 * 60_000;
+// Loss diagnostics are logged at most this often per worker, on state changes
+// only, so a storm does not turn into a log storm.
+const SUPERVISOR_LOSS_LOG_COOLDOWN_MS = 30_000;
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
@@ -549,6 +566,10 @@ export class AgentDaemon {
 	private supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
 	private supervisorFenceTimer?: ReturnType<typeof setTimeout>;
 	private supervisorLaunchInProgress = false;
+	private supervisorLastLaunchAttemptAt = 0;
+	private supervisorLastLossLogAt = 0;
+	/** 0 when not currently in a hung-owner deferral streak; set on first defer. */
+	private supervisorHungOwnerDeferredSinceAt = 0;
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
@@ -747,12 +768,72 @@ export class AgentDaemon {
 			return;
 		}
 		if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+			// Recovery from a hang manifests as a successful connect on a later
+			// availability check. Reset the deferral streak here so the next
+			// incident starts with a full damping budget instead of escalating
+			// immediately on a stale streak timestamp.
+			this.supervisorHungOwnerDeferredSinceAt = 0;
+			return;
+		}
+		this.reportSupervisorLoss(supervisorSocketPath);
+		// Launch cooldown: never spawn more often than SUPERVISOR_LAUNCH_COOLDOWN_MS
+		// per worker, so a lingering lock or a hung owner cannot produce a
+		// replacement-supervisor storm (observed twice on 2026-08-24).
+		if (Date.now() - this.supervisorLastLaunchAttemptAt < SUPERVISOR_LAUNCH_COOLDOWN_MS) {
+			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
 			return;
 		}
 		await this.launchReplacementSupervisor(supervisorSocketPath);
 		if (!this.shuttingDown && !this.hasAuthenticatedSupervisorConnection()) {
 			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
 		}
+	}
+
+	/**
+	 * One-line, rate-limited loss diagnostic. Reads the supervisor state journal
+	 * so triage can see who vanished, how old its last heartbeat was, whether
+	 * the process is still alive, and whether it exited gracefully. This closes
+	 * the gap that left the 2026-08-24 PID 5802 disappearance unexplained.
+	 */
+	private reportSupervisorLoss(supervisorSocketPath: string): void {
+		const now = Date.now();
+		if (now - this.supervisorLastLossLogAt < SUPERVISOR_LOSS_LOG_COOLDOWN_MS) {
+			return;
+		}
+		this.supervisorLastLossLogAt = now;
+		try {
+			const state = readSupervisorState(supervisorSocketPath);
+			const facts = state
+				? [
+						`pid=${state.pid}`,
+						`generation=${state.generation}`,
+						`startedAt=${state.startedAt}`,
+						`heartbeatAgeMs=${Math.round(now - Date.parse(state.lastHeartbeatAt))}`,
+						`processAlive=${this.isProcessAlive(state.pid)}`,
+						`exited=${state.exitReason ?? "none"}`,
+					].join(" ")
+				: "no supervisor state journal (older supervisor build or journal write failed)";
+			this.log(`supervisor loss detected on ${supervisorSocketPath}: ${facts}`);
+		} catch {
+			// Diagnostics must never throw into the availability-check chain.
+		}
+	}
+
+	/**
+	 * True when the state journal shows a live owner whose heartbeat is fresh
+	 * (i.e. an alive-but-hung supervisor). Workers must not spawn replacements
+	 * into a contested socket lock in that case.
+	 */
+	private supervisorOwnerAliveAndFresh(supervisorSocketPath: string): boolean {
+		const state = readSupervisorState(supervisorSocketPath);
+		if (!state || state.exitedAt) {
+			return false;
+		}
+		if (!this.isProcessAlive(state.pid)) {
+			return false;
+		}
+		const age = Date.now() - Date.parse(state.lastHeartbeatAt);
+		return Number.isFinite(age) && age < SUPERVISOR_STATE_FRESH_MS;
 	}
 
 	private hasAuthenticatedSupervisorConnection(): boolean {
@@ -843,6 +924,7 @@ export class AgentDaemon {
 			return;
 		}
 		this.supervisorLaunchInProgress = true;
+		this.supervisorLastLaunchAttemptAt = Date.now();
 		const key = createHash("sha256").update(supervisorSocketPath).digest("hex").slice(0, 12);
 		const lockDirectory = join(dirname(supervisorSocketPath), `.supervisor-launch-${key}.lock`);
 		let ownsLock = false;
@@ -890,6 +972,56 @@ export class AgentDaemon {
 			if (await this.canConnectToSupervisor(supervisorSocketPath)) {
 				return;
 			}
+			// Hung-owner damping: the journal shows a live owner with a fresh
+			// heartbeat but the socket is unreachable. Hold the election lock and
+			// wait for the owner to exit or its heartbeat to go stale instead of
+			// spawning a replacement that would fight over the socket lock. This is
+			// the deterministic single-winner path: the lock holder waits, every
+			// other worker defers.
+			if (this.supervisorOwnerAliveAndFresh(supervisorSocketPath)) {
+				const waitDeadline = Date.now() + SUPERVISOR_HUNG_OWNER_WAIT_MS;
+				while (!this.shuttingDown && Date.now() < waitDeadline) {
+					if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+						this.supervisorHungOwnerDeferredSinceAt = 0;
+						return;
+					}
+					if (!this.supervisorOwnerAliveAndFresh(supervisorSocketPath)) {
+						break;
+					}
+					await delay(250);
+				}
+				if (this.supervisorOwnerAliveAndFresh(supervisorSocketPath)) {
+					if (this.supervisorHungOwnerDeferredSinceAt === 0) {
+						this.supervisorHungOwnerDeferredSinceAt = Date.now();
+					}
+					const deferredForMs = Date.now() - this.supervisorHungOwnerDeferredSinceAt;
+					if (deferredForMs < SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS) {
+						this.log(
+							`supervisor replacement deferred: owner alive but unreachable on ${supervisorSocketPath}; waiting for owner exit`,
+						);
+						return;
+					}
+					// The "fresh heartbeat implies a genuinely contested socket lock" is an
+					// unverified inference: it can also mean a listener died while its event
+					// loop (and heartbeat) kept running, in which case deferring forever is
+					// indefinite supervisor absence as a quiet steady state -- worse than the
+					// bounded churn SUPERVISOR_LAUNCH_COOLDOWN_MS already caps. Escalate to a
+					// warning and permit exactly one spawn attempt to fall through below; if
+					// the lock genuinely is held, this attempt is cheap (the very cooldown
+					// this deferral logic complements) and the owner keeps it either way.
+					this.log(
+						`supervisor replacement: owner alive but unreachable on ${supervisorSocketPath} for over ${Math.round(SUPERVISOR_HUNG_OWNER_DEFER_BUDGET_MS / 1000)}s; escalating past deferral and attempting one spawn`,
+					);
+					this.supervisorHungOwnerDeferredSinceAt = 0;
+				}
+			} else {
+				this.supervisorHungOwnerDeferredSinceAt = 0;
+			}
+			// Any path that reaches the spawn (stale owner mid-wait, escalated past
+			// budget, or no fresh owner at entry) means the hung-owner condition no
+			// longer holds right now; reset the streak so the next incident starts
+			// with a fresh damping budget.
+			this.supervisorHungOwnerDeferredSinceAt = 0;
 			if (await isDaemonShutdownAdmissionActive()) {
 				return;
 			}

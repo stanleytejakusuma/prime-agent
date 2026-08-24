@@ -108,6 +108,13 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
+import {
+	markSupervisorExited,
+	SUPERVISOR_STATE_HEARTBEAT_MS,
+	type SupervisorStateRecord,
+	touchSupervisorHeartbeat,
+	writeSupervisorState,
+} from "./daemon-supervisor-state.js";
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -151,6 +158,8 @@ const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
 const STOP_FINALIZATION_RETRY_MS = 5000;
 const STALE_RECLAIM_WAIT_MS = 10_000;
+/** Rate limit for logging a repeatedly failing supervisor-state heartbeat write. */
+const SUPERVISOR_STATE_HEARTBEAT_FAILURE_LOG_COOLDOWN_MS = 30_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
 // supervisor event loop with synchronous subprocess spawns.
@@ -663,6 +672,8 @@ export class DaemonSupervisor {
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
 	private idleEvictionSweep?: Promise<void>;
 	private idleEvictionFence?: Promise<void>;
+	private supervisorState?: SupervisorStateRecord;
+	private supervisorStateHeartbeatTimer?: ReturnType<typeof setInterval>;
 
 	constructor(
 		private readonly socketPath: string,
@@ -761,6 +772,7 @@ export class DaemonSupervisor {
 			this.scheduleIdleEvictionSweep();
 			await this.ownership.updatePhase("owner");
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
+			this.startSupervisorStateJournal();
 			this.markReady();
 		} catch (error) {
 			const startupError = error instanceof Error ? error : new Error(String(error));
@@ -5546,6 +5558,66 @@ export class DaemonSupervisor {
 		cleanupDaemonSocketPath(this.socketPath, identity, this.socketLease);
 	}
 
+	/**
+	 * Durable lifecycle journal for supervisor-loss triage and deterministic
+	 * worker election. The record is written once startup is listening, then
+	 * heartbeated every second so workers can distinguish a dead supervisor
+	 * (stale heartbeat, pid gone) from a hung one (fresh heartbeat, dead
+	 * socket) and so every disappearance has a last-known identity.
+	 */
+	private startSupervisorStateJournal(): void {
+		try {
+			const record: SupervisorStateRecord = {
+				version: 1,
+				pid: process.pid,
+				processStartId: getProcessStartId(process.pid),
+				generation: this.generation,
+				socketPath: this.socketPath,
+				appVersion: VERSION,
+				startedAt: new Date().toISOString(),
+				lastHeartbeatAt: new Date().toISOString(),
+			};
+			writeSupervisorState(record);
+			this.supervisorState = record;
+			this.supervisorStateHeartbeatTimer = setInterval(() => {
+				if (this.supervisorState && !this.shuttingDown) {
+					// Diagnostics must be strictly weaker than the thing they diagnose:
+					// an exception thrown here is an uncaught exception inside a timer
+					// callback (process-fatal), which would turn a transient journal
+					// write failure (disk full, socket dir removed) into exactly the
+					// supervisor-loss incident this journal exists to help recover
+					// from -- self-inflicted, once per second.
+					try {
+						touchSupervisorHeartbeat(this.supervisorState);
+					} catch (error) {
+						this.logSupervisorHeartbeatFailure(error);
+					}
+				}
+			}, SUPERVISOR_STATE_HEARTBEAT_MS);
+			this.supervisorStateHeartbeatTimer.unref?.();
+		} catch (error) {
+			this.log(`could not write supervisor state journal: ${String(error)}`);
+		}
+	}
+
+	private lastSupervisorHeartbeatFailureLogAt = 0;
+
+	/** Rate-limited so a sustained write failure cannot flood the log at 1 Hz. */
+	private logSupervisorHeartbeatFailure(error: unknown): void {
+		const now = Date.now();
+		if (now - this.lastSupervisorHeartbeatFailureLogAt < SUPERVISOR_STATE_HEARTBEAT_FAILURE_LOG_COOLDOWN_MS) {
+			return;
+		}
+		this.lastSupervisorHeartbeatFailureLogAt = now;
+		try {
+			this.log(`supervisor state heartbeat write failed (will keep retrying): ${String(error)}`);
+		} catch {
+			// The logging path can fail in the same disk-failure scenario that broke
+			// the heartbeat write. Diagnostics must be total: never let the failure
+			// logger itself throw back into the timer callback.
+		}
+	}
+
 	private async cleanupSupervisorResources(): Promise<void> {
 		if (this.cleanupPromise) {
 			return this.cleanupPromise;
@@ -5556,6 +5628,20 @@ export class DaemonSupervisor {
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
+		if (this.supervisorStateHeartbeatTimer) {
+			clearInterval(this.supervisorStateHeartbeatTimer);
+			this.supervisorStateHeartbeatTimer = undefined;
+		}
+		if (this.supervisorState) {
+			try {
+				markSupervisorExited(this.socketPath, this.supervisorState, "cleanup");
+			} catch (error) {
+				// A rename/write failure during shutdown on a broken disk must not
+				// strand the remaining cleanup steps (eviction timer, signal
+				// handlers, socket/lock release).
+				this.log(`could not mark supervisor exited: ${String(error)}`);
+			}
+		}
 		this.clearIdleEvictionTimer();
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
