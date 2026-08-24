@@ -42,7 +42,7 @@ import type {
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
 import { AgentConnectionPromptAdmissionError } from "../src/modes/agent-connection/types.js";
-import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
+import { AgentActivityTracker, SessionUsageTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
@@ -703,6 +703,7 @@ describe("InteractiveMode working timer", () => {
 		return Object.assign(Object.create(InteractiveMode.prototype), {
 			turnStartedAt,
 			workingStartedAt: turnStartedAt,
+			sessionUsageTracker: new SessionUsageTracker(),
 			agentConnection: { getInitialSnapshot: vi.fn(async () => snapshot) },
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: snapshot.messages,
@@ -1517,6 +1518,7 @@ describe("InteractiveMode connection events", () => {
 		const renderSessionContextMock = vi.fn(async () => {});
 		const restoreStreamingMessageFromSnapshot = vi.fn(async () => {});
 		const fakeThis = {
+			sessionUsageTracker: new SessionUsageTracker(),
 			agentConnection: { getInitialSnapshot: vi.fn(async () => snapshots.shift()!) },
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
@@ -1719,6 +1721,7 @@ describe("InteractiveMode connection events", () => {
 		const fakeThis = {
 			turnStartedAt: 1,
 			workingStartedAt: 1,
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionEvent: sideQuestion,
 			activeConnectionExtensionUiRequests: extensionRequests,
 			activeBashComponent,
@@ -1779,6 +1782,7 @@ describe("InteractiveMode connection events", () => {
 			messages: [],
 		};
 		const fakeThis = {
+			sessionUsageTracker: new SessionUsageTracker(),
 			activeBashComponent: bashComponent,
 			streamingComponent: {},
 			streamingMessage: {},
@@ -1855,6 +1859,7 @@ describe("InteractiveMode connection events", () => {
 			releaseQueue = resolve;
 		});
 		const fakeThis = {
+			sessionUsageTracker: new SessionUsageTracker(),
 			agentConnection: {
 				subscribe: (callback: (event: Event) => Promise<void>) => {
 					listener = callback;
@@ -2001,6 +2006,7 @@ describe("InteractiveMode tool event rendering", () => {
 			isInitialized: true,
 			init: vi.fn(async () => {}),
 			footer: { invalidate: vi.fn() },
+			sessionUsageTracker: new SessionUsageTracker(),
 			updateConnectionStateFromEvent: vi.fn(),
 			activityTracker: new AgentActivityTracker(),
 			streamingComponent: { updateContent: vi.fn() },
@@ -5446,6 +5452,7 @@ test("only the queued user /refine settlement stops its loader", async () => {
 		updateConnectionStateFromEvent: vi.fn(),
 		prepareFeatureHintRun: vi.fn(),
 		activityTracker: { handleEvent: vi.fn(), reset: vi.fn() },
+		sessionUsageTracker: new SessionUsageTracker(),
 		updateWorkingLoaderMessage: vi.fn(),
 		renderRecap: vi.fn(),
 	} as unknown as InteractiveMode;

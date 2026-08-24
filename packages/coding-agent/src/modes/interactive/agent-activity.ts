@@ -133,3 +133,100 @@ export function formatTokenCount(count: number): string {
 	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
 	return `${Math.round(count / 1000000)}M`;
 }
+
+/**
+ * Cumulative per-session token/cost usage for the footer's stats line (pi
+ * 0.84.2 parity). The client cannot rescan the full transcript synchronously
+ * inside render(), so this tracker is seeded from the attach snapshot's
+ * messages and then incremented from live message_end events -- the same
+ * totals pi computes by iterating the session file every render, just kept
+ * incrementally client-side.
+ */
+export interface SessionUsageTotals {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
+export class SessionUsageTracker {
+	private totals: SessionUsageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	private hasData = false;
+
+	/** Seed from an already-complete message list (attach snapshot). */
+	seed(messages: readonly { usage?: unknown }[] | readonly unknown[]): void {
+		this.reset();
+		for (const message of messages) {
+			this.addMessageUsage(message);
+		}
+	}
+
+	/** Consume a live session event; returns true when it updated the totals. */
+	handleEvent(event: { type: string; message?: unknown }): boolean {
+		if (event.type === "message_end" && event.message) {
+			return this.addMessageUsage(event.message);
+		}
+		return false;
+	}
+
+	/** Accumulate usage from one message (assistant or tool-result style usage objects). */
+	private addMessageUsage(message: { usage?: unknown } | unknown): boolean {
+		const candidate = message as { usage?: unknown } | null;
+		const usage = candidate?.usage as
+			| {
+					input?: number;
+					output?: number;
+					cacheRead?: number;
+					cacheWrite?: number;
+					cost?: { total?: number };
+			  }
+			| undefined;
+		if (!usage || typeof usage !== "object") {
+			return false;
+		}
+		const input = usage.input ?? 0;
+		const output = usage.output ?? 0;
+		const cacheRead = usage.cacheRead ?? 0;
+		const cacheWrite = usage.cacheWrite ?? 0;
+		if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0) {
+			return false;
+		}
+		this.totals.input += input;
+		this.totals.output += output;
+		this.totals.cacheRead += cacheRead;
+		this.totals.cacheWrite += cacheWrite;
+		this.totals.cost += usage.cost?.total ?? 0;
+		this.hasData = true;
+		return true;
+	}
+
+	getTotals(): SessionUsageTotals {
+		return { ...this.totals };
+	}
+
+	/**
+	 * Cumulative cache hit rate over the whole session (pi parity):
+	 * totalCacheRead / (totalInput + totalCacheRead + totalCacheWrite).
+	 * Derived from the aggregate totals, not the last message.
+	 */
+	getCacheHitRate(): number | null {
+		if (!this.hasData) {
+			return null;
+		}
+		const promptTokens = this.totals.input + this.totals.cacheRead + this.totals.cacheWrite;
+		if (promptTokens <= 0) {
+			return null;
+		}
+		return (this.totals.cacheRead / promptTokens) * 100;
+	}
+
+	get hasAnyData(): boolean {
+		return this.hasData;
+	}
+
+	reset(): void {
+		this.totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+		this.hasData = false;
+	}
+}
