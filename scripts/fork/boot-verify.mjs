@@ -78,15 +78,20 @@ step("throwaway daemon starts and reports status", () => {
 
 // 3. Fork feature presence markers. A stale or feature-dropping build silently
 //    loses UI surfaces (the status-line footer was once reported "gone" when
-//    the running bundle predated its source). These literals survive bundling
-//    and minification, so their absence means the built artifact is not the
-//    current fork. Update this list when a user-visible fork feature ships.
+//    the running bundle predated its source). Each marker below is a plain
+//    string literal (a capability name, protocol id, or user-facing hint
+//    text) that appears verbatim in source and is guaranteed to survive
+//    bundling and minification -- property/method names are deliberately
+//    NOT used here (Red review 2026-08-24: an identifier like a method name
+//    can be mangled if property renaming is ever enabled, and coupling this
+//    branch's gate to a different feature's identifier ties their fates
+//    together for no reason). Each marker is scoped to the branch that
+//    introduced it; when a branch is reverted, remove its markers too.
 step("bundle contains fork feature markers", () => {
 	const bundleText = readFileSync(bundlePath, "utf8");
 	const markers = [
-		"agents/resume", // chat tray hint (fork agents view navigation)
-		"session_usage_snapshot", // agents-view usage snapshot capability (protocol 23)
-		"setStatusLineProvider", // client footer status-line parity
+		"agents/resume", // chat tray hint (fork agents view navigation, feat/status-line-parity)
+		"session_usage_snapshot", // agents-view usage snapshot capability id (protocol 23, feat/agents-view-status-footer)
 	];
 	const missing = markers.filter((marker) => !bundleText.includes(marker));
 	if (missing.length > 0) {

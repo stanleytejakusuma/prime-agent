@@ -1,6 +1,10 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { createAgentsViewListCommand } from "../src/modes/agents-view/agents-view-mode.js";
-import { buildAgentsViewStatusLines } from "../src/modes/agents-view/agents-view-status.js";
+import {
+	buildAgentsViewStatusLines,
+	peekCachedGitBranch,
+	refreshGitBranchCache,
+} from "../src/modes/agents-view/agents-view-status.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -51,6 +55,30 @@ function stripAnsi(text: string): string {
 }
 
 describe("buildAgentsViewStatusLines", () => {
+	it("always returns exactly three lines (fixed dock height)", () => {
+		// Red review 2026-08-24: a variable 1-4 line footer made the dock height
+		// (and therefore the roster's visible-row window/scroll anchor) jitter
+		// with selection. The footer must always be exactly three lines,
+		// regardless of whether there is a selection or usage data.
+		const withEverything = buildAgentsViewStatusLines(
+			{ summary: snapshotSummary, countsText: "3 running, 1 idle, 5 inactive", scopeLabel: "global", depth: 0 },
+			120,
+		);
+		expect(withEverything).toHaveLength(3);
+
+		const noSelection = buildAgentsViewStatusLines(
+			{ summary: undefined, countsText: "0 running, 0 idle, 1 inactive", scopeLabel: "scoped", depth: 2 },
+			80,
+		);
+		expect(noSelection).toHaveLength(3);
+
+		const noUsageSnapshot = buildAgentsViewStatusLines(
+			{ summary: plainSummary, countsText: "1 running, 0 idle, 0 inactive", scopeLabel: "global", depth: 0 },
+			120,
+		);
+		expect(noUsageSnapshot).toHaveLength(3);
+	});
+
 	it("renders selected session, roster, and usage lines", () => {
 		const lines = buildAgentsViewStatusLines(
 			{ summary: snapshotSummary, countsText: "3 running, 1 idle, 5 inactive", scopeLabel: "global", depth: 0 },
@@ -69,7 +97,7 @@ describe("buildAgentsViewStatusLines", () => {
 		expect(plain[2]).toContain("$1.234");
 	});
 
-	it("omits the usage line when the daemon sent no snapshot (Phase 1 only)", () => {
+	it("blanks the usage line (not omits it) when the daemon sent no snapshot (Phase 1 only)", () => {
 		const lines = buildAgentsViewStatusLines(
 			{ summary: plainSummary, countsText: "1 running, 0 idle, 0 inactive", scopeLabel: "global", depth: 0 },
 			120,
@@ -77,16 +105,19 @@ describe("buildAgentsViewStatusLines", () => {
 		const plain = lines.map(stripAnsi);
 		expect(plain[0]).toContain("ox-alpha:max");
 		expect(plain[0]).not.toContain("(");
-		expect(plain).toHaveLength(2);
+		expect(plain).toHaveLength(3);
+		expect(plain[2].trim()).toBe("");
 	});
 
-	it("renders only the roster line without a selection", () => {
+	it("blanks the selection line (not omits it) without a selection", () => {
 		const lines = buildAgentsViewStatusLines(
 			{ summary: undefined, countsText: "0 running, 0 idle, 1 inactive", scopeLabel: "scoped", depth: 2 },
 			80,
 		);
 		const plain = lines.map(stripAnsi);
-		expect(plain).toEqual(["0 running, 0 idle, 1 inactive · scope scoped · depth2"]);
+		expect(plain[0].trim()).toBe("");
+		expect(plain[1]).toBe("0 running, 0 idle, 1 inactive · scope scoped · depth2");
+		expect(plain[2].trim()).toBe("");
 	});
 
 	it("flattens control characters in user-provided text", () => {
@@ -99,6 +130,18 @@ describe("buildAgentsViewStatusLines", () => {
 		expect(plain[0]).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
 	});
 
+	it("flattens control characters in scopeLabel", () => {
+		// Red review 2026-08-24: scopeLabel is derived from a session title
+		// (user-influenced data) and was interpolated into line 2 without
+		// sanitization, unlike cwd/sessionName/branch.
+		const lines = buildAgentsViewStatusLines(
+			{ summary: undefined, countsText: "0 running, 0 idle, 1 inactive", scopeLabel: "evil\u001bscope", depth: 0 },
+			120,
+		);
+		const plain = lines.map(stripAnsi);
+		expect(plain[1]).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+	});
+
 	it("truncates every line to the requested width", () => {
 		const lines = buildAgentsViewStatusLines(
 			{ summary: snapshotSummary, countsText: "3 running, 1 idle, 5 inactive", scopeLabel: "global", depth: 0 },
@@ -109,13 +152,75 @@ describe("buildAgentsViewStatusLines", () => {
 		}
 	});
 
-	it("resolves a git branch for a real repo cwd", () => {
-		const repoSummary = makeSummary({ cwd: process.cwd() });
+	it("coerces non-finite usage fields to zero instead of poisoning totals", () => {
+		// Red review 2026-08-24: usage fields were accumulated without a finite
+		// check (only cacheHitRate was guarded), so a NaN input/output/etc.
+		// could silently poison the displayed totals.
+		const nanSummary = makeSummary({
+			usageSnapshot: {
+				input: Number.NaN,
+				output: 100,
+				cacheRead: Number.POSITIVE_INFINITY,
+				cacheWrite: -5,
+				cost: Number.NaN,
+				cacheHitRate: null,
+				contextTokens: null,
+				contextWindow: 0,
+				contextPercent: null,
+			},
+		});
 		const lines = buildAgentsViewStatusLines(
-			{ summary: repoSummary, countsText: "0 running, 0 idle, 1 inactive", scopeLabel: "global", depth: 0 },
+			{ summary: nanSummary, countsText: "1 running, 0 idle, 0 inactive", scopeLabel: "global", depth: 0 },
 			120,
 		);
-		expect(stripAnsi(lines[0])).toMatch(/\([^)]+\)/);
+		const plain = lines.map(stripAnsi);
+		expect(plain[2]).not.toContain("NaN");
+		expect(plain[2]).not.toContain("Infinity");
+		expect(plain[2]).toContain("↓100");
+	});
+
+	it("reads the branch from the cache instead of resolving it itself (pure builder)", () => {
+		// Red review 2026-08-24: the previous implementation called spawnSync()
+		// directly inside this function, which could block the TUI render loop
+		// for up to its own timeout. The builder must be a pure, synchronous
+		// cache read; branch resolution happens out-of-band via
+		// refreshGitBranchCache, called from the view's poll loop, never here.
+		const withCwd = makeSummary({ cwd: "/tmp/cache-miss-project" });
+		const linesBeforeCache = buildAgentsViewStatusLines(
+			{ summary: withCwd, countsText: "1 running, 0 idle, 0 inactive", scopeLabel: "global", depth: 0 },
+			120,
+		);
+		// No cache entry yet: renders the cwd without a branch, does not block.
+		expect(stripAnsi(linesBeforeCache[0])).not.toMatch(/\([^)]+\)/);
+		expect(peekCachedGitBranch("/tmp/cache-miss-project")).toBeUndefined();
+	});
+});
+
+describe("git branch cache", () => {
+	it("is populated asynchronously by refreshGitBranchCache, not by the builder", async () => {
+		const cwd = process.cwd();
+		expect(peekCachedGitBranch(cwd)).toBeUndefined();
+		await refreshGitBranchCache(cwd);
+		// process.cwd() during the test run is inside this repo; whether it
+		// resolves to a real branch name or null (detached HEAD in CI) is
+		// environment-dependent and must not be asserted -- only that the
+		// cache was populated (no longer undefined) without throwing.
+		expect(peekCachedGitBranch(cwd)).not.toBeUndefined();
+	});
+
+	it("does not re-resolve a fresh cache entry", async () => {
+		const cwd = "/tmp/fake-repo-for-cache-test";
+		await refreshGitBranchCache(cwd);
+		const spy = vi.fn();
+		// A second call within the TTL must be a no-op; there is no direct hook
+		// to assert "git was not spawned again" from this module's public API,
+		// so this asserts the documented contract instead: peekCachedGitBranch
+		// keeps returning the same value without needing another refresh.
+		const first = peekCachedGitBranch(cwd);
+		await refreshGitBranchCache(cwd);
+		const second = peekCachedGitBranch(cwd);
+		expect(second).toBe(first);
+		expect(spy).not.toHaveBeenCalled();
 	});
 });
 

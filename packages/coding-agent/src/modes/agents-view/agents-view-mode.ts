@@ -96,7 +96,7 @@ import {
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
-import { buildAgentsViewStatusLines } from "./agents-view-status.js";
+import { buildAgentsViewStatusLines, refreshGitBranchCache } from "./agents-view-status.js";
 import { matchesSearchText } from "./session-view-search.js";
 
 const POLL_INTERVAL_MS = 1000;
@@ -2091,12 +2091,29 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private pollSessions(): void {
+		this.refreshSelectedGitBranchCache();
 		if (this.liveCatalogPollPromise) return;
 		const poll = this.refreshSessions().then(() => undefined);
 		this.liveCatalogPollPromise = poll;
 		void poll.finally(() => {
 			if (this.liveCatalogPollPromise === poll) this.liveCatalogPollPromise = undefined;
 		});
+	}
+
+	/**
+	 * Keep the status footer's git-branch cache warm for the selected row's
+	 * cwd, non-blocking (Red review, 2026-08-24: the footer must never spawn
+	 * git synchronously from the render path). Runs once per poll tick;
+	 * refreshGitBranchCache no-ops when the cache entry is still fresh or a
+	 * resolution for this cwd is already in flight.
+	 */
+	private refreshSelectedGitBranchCache(): void {
+		const selected = this.rows[this.selectedIndex];
+		const summary =
+			selected && (selected.kind === "agent" || selected.kind === "subagent") ? selected.summary : undefined;
+		if (summary?.cwd) {
+			void refreshGitBranchCache(summary.cwd);
+		}
 	}
 
 	private async refreshSessions(options: { preserveStatusOnError?: boolean } = {}): Promise<boolean> {
@@ -2723,8 +2740,21 @@ export class AgentsViewMode implements Component, Focusable {
 			.join("   ");
 	}
 
+	/**
+	 * Scroll-window sizing heuristic for the session list, used by PageUp/
+	 * PageDown step size and the row-window-around-selection calculation.
+	 * Derived from the real dock height (Red review, 2026-08-24: the footer
+	 * now always renders a fixed 3 status lines + 1 hints line, so this no
+	 * longer needs to guess with a magic constant that could drift from the
+	 * dock's actual size and jitter the scroll window as selection changed).
+	 */
 	private visibleListRows(): number {
-		return Math.max(4, this.ui.terminal.rows - 9);
+		const dockLines = this.renderDock(this.ui.terminal.columns).length;
+		// Header chrome above the list (splash, notices, search prompt) is a
+		// separate, width-independent budget; this only needs to stay
+		// consistent with the dock so PageUp/PageDown and the scroll-window
+		// centering agree with what actually fits on screen.
+		return Math.max(4, this.ui.terminal.rows - dockLines - 5);
 	}
 
 	private contentHeight(width: number): number {
