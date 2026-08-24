@@ -44,9 +44,14 @@ export interface AgentsViewStatusLineData {
 	/** Scope label: scoped session title, or "global" for the root view. */
 	scopeLabel?: string;
 	depth: number;
+	/** Milliseconds since the last successfully decoded daemon frame. Undefined
+	 *  means no frame has ever been decoded (unknown), never healthy. */
+	daemonFrameAgeMs?: number;
 }
 
 const GIT_BRANCH_TTL_MS = 15_000;
+/** A daemon frame older than this is stale. Poll runs at 1s, so 3s is 3 missed polls. */
+const DAEMON_FRAME_STALE_MS = 3000;
 const GIT_BRANCH_NEGATIVE_TTL_MS = 15_000;
 const GIT_BRANCH_MAX_CACHE_ENTRIES = 64;
 const GIT_BRANCH_RESOLVE_TIMEOUT_MS = 2000;
@@ -199,6 +204,23 @@ function buildUsageLine(usage: SessionUsageSnapshot): string {
  * synchronous: reads the module-level branch cache (see peekCachedGitBranch)
  * instead of resolving a branch itself.
  */
+/**
+ * Control-plane trust capsule (Red inspiration 2026-08-24). Leftmost element
+ * of line 2. If the daemon feed is stale or misdecoded, every other footer
+ * value can look plausible while being wrong, so the capsule is the first
+ * thing the eye should hit. Missing data renders as unknown, never healthy.
+ */
+function renderDaemonTrustCapsule(ageMs: number | undefined): string {
+	if (ageMs === undefined) {
+		return "D?";
+	}
+	const seconds = Math.max(0, Math.floor(ageMs / 1000));
+	if (ageMs > DAEMON_FRAME_STALE_MS) {
+		return `D! STALE ${seconds}s`;
+	}
+	return `D\u2713 ${seconds}s`;
+}
+
 export function buildAgentsViewStatusLines(data: AgentsViewStatusLineData, width: number): string[] {
 	const safeWidth = Math.max(1, width);
 	const summary = data.summary;
@@ -233,8 +255,8 @@ export function buildAgentsViewStatusLines(data: AgentsViewStatusLineData, width
 		}
 	}
 
-	// Line 2: roster summary, always present.
-	const rosterParts: string[] = [data.countsText];
+	// Line 2: trust capsule first, then roster summary. Both always present.
+	const rosterParts: string[] = [renderDaemonTrustCapsule(data.daemonFrameAgeMs), data.countsText];
 	const scopeLabel = data.scopeLabel ? sanitizeInline(data.scopeLabel) : undefined;
 	if (scopeLabel) {
 		rosterParts.push(`scope ${scopeLabel}`);

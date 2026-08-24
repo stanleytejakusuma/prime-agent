@@ -649,6 +649,8 @@ export class AgentsViewMode implements Component, Focusable {
 	private workingIconFrame = 0;
 	private rows: AgentsViewRow[] = [];
 	private lastListedSummaries: SessionSummary[] = [];
+	/** Timestamp of the last successfully decoded live daemon frame; undefined until the first success. */
+	private lastDecodedDaemonFrameAt: number | undefined = undefined;
 	private lastVisibleSummaries: SessionSummary[] = [];
 	private savedSessions: AgentConnectionSavedSessionInfo[] = [];
 	private lastSuccessfulSavedSessions: AgentConnectionSavedSessionInfo[] = [];
@@ -2281,7 +2283,12 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private applySessionList(sessions: SessionSummary[], successful = false): void {
 		this.lastListedSummaries = sessions;
-		if (successful) this.persistentState.lastSuccessfulLiveSummaries = sessions;
+		if (successful) {
+			this.persistentState.lastSuccessfulLiveSummaries = sessions;
+			// A successfully decoded and applied roster proves the daemon control
+			// plane is fresh right now (trust capsule source).
+			this.lastDecodedDaemonFrameAt = Date.now();
+		}
 		this.reconcileCatalogs();
 	}
 
@@ -2809,6 +2816,8 @@ export class AgentsViewMode implements Component, Focusable {
 				countsText: this.getAgentCountsText(),
 				scopeLabel: this.scopeRootSummary ? getAgentsViewSessionTitle(this.scopeRootSummary) : "global",
 				depth: getAgentsViewDepth(this.scopeRootSummary),
+				daemonFrameAgeMs:
+					this.lastDecodedDaemonFrameAt === undefined ? undefined : Date.now() - this.lastDecodedDaemonFrameAt,
 			},
 			width,
 		);

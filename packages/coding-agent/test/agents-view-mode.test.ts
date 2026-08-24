@@ -577,6 +577,39 @@ describe("AgentsViewMode", () => {
 		expect(rows.map((row) => row.summary.sessionId)).toEqual(["older-session", "newer-session"]);
 	});
 
+	it("stamps the decoded-daemon-frame time on a successful roster apply (trust capsule source)", () => {
+		const self: Record<string, unknown> = {
+			persistentState: {},
+			lastListedSummaries: [],
+			lastDecodedDaemonFrameAt: undefined,
+			savedSessions: [],
+			heartbeats: [],
+			inactiveAgentIdentities: new Set(),
+			pendingDeleteAgent: undefined,
+			expandedSubagentParents: new Set(),
+			programShownParents: new Set(),
+			manualOrder: {},
+			editor: { getText: () => "" },
+			getFilteredRecords: () => [],
+			applyPendingAncestorExpansion: vi.fn(),
+			restoreSelection: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			setStatusMessage: vi.fn(),
+			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			reconcileCatalogs: vi.fn(),
+		};
+		const before = Date.now();
+		invoke("applySessionList", self, [], true);
+		const stamped = Reflect.get(self, "lastDecodedDaemonFrameAt") as number;
+		expect(stamped).toBeGreaterThanOrEqual(before);
+		expect(stamped).toBeLessThanOrEqual(Date.now());
+
+		// An unsuccessful apply must not stamp (a failed refresh is not fresh).
+		Reflect.set(self, "lastDecodedDaemonFrameAt", undefined);
+		invoke("applySessionList", self, [], false);
+		expect(Reflect.get(self, "lastDecodedDaemonFrameAt")).toBeUndefined();
+	});
+
 	it("carries the resolved scope root across view remounts", () => {
 		const root = summary({ sessionName: "Scoped root" });
 		const persistentState: AgentsViewPersistentState = {
