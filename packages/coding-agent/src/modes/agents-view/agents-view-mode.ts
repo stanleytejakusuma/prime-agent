@@ -656,8 +656,13 @@ export class AgentsViewMode implements Component, Focusable {
 	private scopedRecords: UnifiedSessionRecord[] = [];
 	private scopeKey: AgentsViewScopeKey | undefined;
 	private scopeRootSummary: SessionSummary | undefined;
+	// "Ready" allows scope fallback after a terminal fetch failure. Completeness
+	// is stricter: it is set only by a successful full catalog response and
+	// guards destructive reconciliation such as manual-order pruning.
 	private liveCatalogReady = false;
 	private savedCatalogReady = false;
+	private liveCatalogComplete = false;
+	private savedCatalogComplete = false;
 	private savedCatalogGeneration = 0;
 	private liveCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
@@ -937,6 +942,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (
 			!this.replyTarget &&
+			!this.scopeKey &&
 			this.editor.getText().length === 0 &&
 			this.keybindings.matches(data, "app.agents.moveEarlier")
 		) {
@@ -945,6 +951,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (
 			!this.replyTarget &&
+			!this.scopeKey &&
 			this.editor.getText().length === 0 &&
 			this.keybindings.matches(data, "app.agents.moveLater")
 		) {
@@ -953,6 +960,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (
 			!this.replyTarget &&
+			!this.scopeKey &&
 			this.editor.getText().length === 0 &&
 			this.keybindings.matches(data, "app.agents.resetOrder")
 		) {
@@ -1452,6 +1460,9 @@ export class AgentsViewMode implements Component, Focusable {
 	 * this move; a stale keypress simply cannot happen here.
 	 */
 	private moveSelectedAgent(direction: "earlier" | "later"): void {
+		if (this.scopeKey) {
+			return;
+		}
 		const selected = this.rows[this.selectedIndex];
 		if (!selected || selected.kind !== "agent" || selected.depth !== 0) {
 			return;
@@ -1485,6 +1496,9 @@ export class AgentsViewMode implements Component, Focusable {
 
 	/** Clear the manual order for the selected row's current section only. */
 	private resetSelectedAgentSectionOrder(): void {
+		if (this.scopeKey) {
+			return;
+		}
 		const selected = this.rows[this.selectedIndex];
 		if (!selected || selected.kind !== "agent" || selected.depth !== 0) {
 			return;
@@ -2198,12 +2212,14 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
 		const generation = ++this.liveCatalogGeneration;
 		this.liveCatalogRefreshPending = true;
+		this.liveCatalogComplete = false;
 		try {
 			const client = this.requireClient();
 			try {
 				const response = await client.request(createAgentsViewListCommand());
 				if (generation !== this.liveCatalogGeneration) return false;
 				this.liveCatalogReady = true;
+				this.liveCatalogComplete = true;
 				this.applySessionList(expectSessionList(requireDaemonData(response)), true);
 				return true;
 			} catch (error) {
@@ -2252,10 +2268,15 @@ export class AgentsViewMode implements Component, Focusable {
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
 		this.manualOrder = migrateAgentsViewManualOrder(this.manualOrder, this.unifiedIndex.byKey);
-		this.manualOrder = pruneAgentsViewManualOrder(
-			this.manualOrder,
-			new Set(this.unifiedRecords.map((record) => record.identity)),
-		);
+		// Ready catalogs can still reflect a terminal fetch failure, and saved
+		// catalogs stream progressively. Only successful full enumerations prove
+		// an absent identity is deleted rather than not yet loaded.
+		if (this.liveCatalogComplete && this.savedCatalogComplete) {
+			this.manualOrder = pruneAgentsViewManualOrder(
+				this.manualOrder,
+				new Set(this.unifiedRecords.map((record) => record.identity)),
+			);
+		}
 		this.persistentState.manualOrder = this.manualOrder;
 
 		const frames = this.persistentState.scopeFrames ?? [];
@@ -2300,6 +2321,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.persistentState.savedCatalogGeneration = generation;
 		this.savedCatalogRefreshPending = true;
 		this.savedCatalogReady = false;
+		this.savedCatalogComplete = false;
 		const successfulSessions = this.lastSuccessfulSavedSessions;
 		const progressiveSessions = new Map(
 			successfulSessions.map((session) => [resolvePath(canonicalizePath(session.path)), session]),
@@ -2324,6 +2346,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.savedSessions = sessions;
 			this.lastSuccessfulSavedSessions = sessions;
 			this.savedCatalogReady = true;
+			this.savedCatalogComplete = true;
 			this.persistentState.lastSuccessfulSavedSessions = sessions;
 			this.persistentState.savedSessions = sessions;
 			this.reconcileCatalogs();
@@ -2770,7 +2793,7 @@ export class AgentsViewMode implements Component, Focusable {
 		const selectedSummary = selectedRow?.kind === "subagent-summary";
 		// Reordering is disabled while a search filter narrows the visible list
 		// (see moveSelectedAgent), so the hint only advertises it unfiltered.
-		const reorderAvailable = selectedAgent && this.editor.getText().length === 0;
+		const reorderAvailable = selectedAgent && !this.scopeKey && this.editor.getText().length === 0;
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			selectedSummary
@@ -2790,7 +2813,7 @@ export class AgentsViewMode implements Component, Focusable {
 				: undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
 			reorderAvailable
-				? `${keyText("app.agents.moveEarlier")}/${keyText("app.agents.moveLater")} reorder`
+				? `${keyText("app.agents.moveEarlier")}/${keyText("app.agents.moveLater")} reorder   ${keyText("app.agents.resetOrder")} reset order`
 				: undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)

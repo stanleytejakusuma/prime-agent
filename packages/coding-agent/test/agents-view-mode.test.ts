@@ -479,6 +479,52 @@ describe("AgentsViewMode", () => {
 		expect(persistentState.scopeFrames).toHaveLength(1);
 	});
 
+	it("retains unresolved manual pins until both full catalogs are complete", () => {
+		const buildSelf = (liveCatalogComplete: boolean, savedCatalogComplete: boolean) => {
+			const manualOrder = { idle: ["active:not-yet-streamed"] };
+			const persistentState: AgentsViewPersistentState = { manualOrder };
+			const self: Record<string, unknown> = {
+				persistentState,
+				lastListedSummaries: [],
+				savedSessions: [],
+				heartbeats: [],
+				inactiveAgentIdentities: new Set(),
+				pendingDeleteAgent: undefined,
+				// Ready can be set after a terminal fetch failure. It must not make
+				// an incomplete roster eligible for destructive pruning.
+				liveCatalogReady: true,
+				savedCatalogReady: true,
+				liveCatalogComplete,
+				savedCatalogComplete,
+				expandedSubagentParents: new Set(),
+				programShownParents: new Set(),
+				manualOrder,
+				editor: { getText: () => "" },
+				getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
+				applyPendingAncestorExpansion: vi.fn(),
+				restoreSelection: vi.fn(),
+				ui: { requestRender: vi.fn() },
+				setStatusMessage: vi.fn(),
+				withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			};
+			return { self, persistentState };
+		};
+
+		for (const [liveCatalogComplete, savedCatalogComplete] of [
+			[false, true],
+			[true, false],
+		] as const) {
+			const { self, persistentState } = buildSelf(liveCatalogComplete, savedCatalogComplete);
+			invoke("reconcileCatalogs", self);
+			expect(self.manualOrder).toEqual({ idle: ["active:not-yet-streamed"] });
+			expect(persistentState.manualOrder).toBe(self.manualOrder);
+		}
+
+		const { self } = buildSelf(true, true);
+		invoke("reconcileCatalogs", self);
+		expect(self.manualOrder).toEqual({});
+	});
+
 	it("carries the resolved scope root across view remounts", () => {
 		const root = summary({ sessionName: "Scoped root" });
 		const persistentState: AgentsViewPersistentState = {
@@ -707,6 +753,20 @@ describe("AgentsViewMode manual reorder", () => {
 		return self;
 	}
 
+	it("does not reorder or reset within a scoped frame", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" })];
+		const self: Record<string, unknown> = {
+			...moveHarness(rows, 1, { idle: ["a", "b"] }),
+			scopeKey: { sessionId: "scope-root", activeSessionId: "scope-root" },
+		};
+
+		invoke("moveSelectedAgent", self, "earlier");
+		invoke("resetSelectedAgentSectionOrder", self);
+
+		expect(self.manualOrder).toEqual({ idle: ["a", "b"] });
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
 	it("moves the selected agent earlier and swaps identities in manualOrder, seeded from current display order", () => {
 		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" }), agentRow({ identity: "c" })];
 		const self = moveHarness(rows, 1); // select "b"
@@ -814,28 +874,53 @@ describe("AgentsViewMode manual reorder", () => {
 		expect(self.rebuildRows).not.toHaveBeenCalled();
 	});
 
-	it("handleInput dispatches app.agents.moveEarlier/moveLater/resetOrder only with an empty search box and no active reply", () => {
+	it("dispatches the real default terminal sequences for move earlier, move later, and reset", () => {
 		const moveSelectedAgent = vi.fn();
 		const resetSelectedAgentSectionOrder = vi.fn();
 		const self: Record<string, unknown> = {
 			clearStickyStatusMessage: vi.fn(),
 			renameTarget: undefined,
 			replyTarget: undefined,
+			scopeKey: undefined,
 			editor: { getText: () => "" },
-			keybindings: {
-				matches: (_d: string, action: string) =>
-					action === "app.agents.moveEarlier" ||
-					action === "app.agents.moveLater" ||
-					action === "app.agents.resetOrder",
-			},
+			keybindings: new KeybindingsManager(),
 			clearCtrlCExitHint: vi.fn(),
 			clearDeleteConfirmation: vi.fn(),
 			moveSelectedAgent,
 			resetSelectedAgentSectionOrder,
 		};
 
-		invoke("handleInput", self, "\x1b[1;3A"); // alt+up
-		expect(moveSelectedAgent).toHaveBeenCalledWith("earlier");
+		invoke("handleInput", self, "\x1b[1;3A"); // xterm alt+up
+		invoke("handleInput", self, "\x1b[1;3B"); // xterm alt+down
+		invoke("handleInput", self, "\x1br"); // legacy terminal alt+r
+
+		expect(moveSelectedAgent).toHaveBeenNthCalledWith(1, "earlier");
+		expect(moveSelectedAgent).toHaveBeenNthCalledWith(2, "later");
+		expect(resetSelectedAgentSectionOrder).toHaveBeenCalledOnce();
+	});
+
+	it("does not dispatch reorder actions from a scoped frame", () => {
+		const moveSelectedAgent = vi.fn();
+		const resetSelectedAgentSectionOrder = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: undefined,
+			scopeKey: { sessionId: "scope-root", activeSessionId: "scope-root" },
+			editor: { getText: () => "", handleInput: vi.fn() },
+			keybindings: new KeybindingsManager(),
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			resetSelectedAgentSectionOrder,
+			handleListNavigation: vi.fn(() => true),
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A");
+		invoke("handleInput", self, "\x1br");
+
+		expect(moveSelectedAgent).not.toHaveBeenCalled();
+		expect(resetSelectedAgentSectionOrder).not.toHaveBeenCalled();
 	});
 
 	it("handleInput does not dispatch reorder while the search box has text (filter active)", () => {
@@ -900,6 +985,13 @@ describe("AgentsViewMode manual reorder", () => {
 
 		const subagentHints = invoke("renderHints", buildSelf(subagentRow("a-child", "a", "idle"), ""), 200) as string;
 		expect(subagentHints).not.toContain("reorder");
+
+		const scopedHints = invoke(
+			"renderHints",
+			{ ...buildSelf(agentRow({ identity: "a" }), ""), scopeKey: { sessionId: "scope-root" } },
+			200,
+		) as string;
+		expect(scopedHints).not.toContain("reorder");
 	});
 });
 

@@ -177,7 +177,7 @@ export const KEYBINDINGS = {
 		description: "Move selected agent later within its section",
 	},
 	"app.agents.resetOrder": {
-		defaultKeys: [],
+		defaultKeys: "alt+r",
 		description: "Reset manual order for the selected agent's section",
 	},
 	"app.tree.foldOrUp": {

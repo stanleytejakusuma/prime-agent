@@ -727,7 +727,10 @@ export function buildAgentsViewRows(
 	};
 	const scopedRootRow = scopeRoot ? baseRows.find((row) => row.summary === scopeRoot.summary) : undefined;
 	const visibleRoots = scopedRootRow ? roots.filter((row) => row !== scopedRootRow) : roots;
-	for (const root of orderAgentsViewRoots(visibleRoots, manualOrder)) {
+	// Scoped rows are a subset of the global section. Applying global pins here
+	// would make filtered adjacency become persisted global order, so scoped
+	// views use the regular heuristic and do not expose reordering controls.
+	for (const root of orderAgentsViewRoots(visibleRoots, scope ? undefined : manualOrder)) {
 		emit(root, 0);
 	}
 	return flattened;
@@ -898,7 +901,9 @@ function compareAgentsViewRows(a: AgentsViewRow, b: AgentsViewRow): number {
  *
  * `rows` need not be pre-sorted and may belong to only one section (this is
  * meant to be called once per section). `pinned` identities absent from
- * `rows` are dropped so a currently-invisible pin does not leave a gap.
+ * `rows` are dropped so a currently-invisible pin does not leave a gap. Once
+ * a section is seeded, later unplaced arrivals use their heuristic position,
+ * so a newer arrival can appear above the user's current topmost pin.
  */
 export function orderSectionRows(
 	rows: readonly AgentsViewRow[],
@@ -989,8 +994,10 @@ function ensureAgentsViewIdentityPinned(
  * order (`orderSectionRows` output, mapped to identities) at the moment of
  * the keypress. Either identity may already be pinned or not; either way
  * both end up pinned and swapped, seeding the array on first use per the
- * spec. Callers must pass identities that are actually display-adjacent;
- * this function does not itself verify adjacency.
+ * spec. An invisible pin between the pair remains in the array, so this swap
+ * can change that hidden entry's relative position to both visible entries.
+ * Callers must pass identities that are actually display-adjacent; this
+ * function does not itself verify adjacency.
  */
 export function applyAgentsViewManualMove(
 	pinned: readonly string[] | undefined,

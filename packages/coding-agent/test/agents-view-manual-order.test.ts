@@ -76,7 +76,7 @@ describe("orderSectionRows", () => {
 		expect(ordered.map((row) => row.summary.sessionId)).toEqual(["d", "c", "b", "a"]);
 	});
 
-	test("determinism: repeated calls with the same inputs produce the same order", () => {
+	test("determinism: pinned output is unchanged when equivalent input rows arrive in a different order", () => {
 		const rows = buildAgentsViewRows([
 			idleSummary("a", "2026-01-01T00:00:00Z"),
 			idleSummary("b", "2026-01-02T00:00:00Z"),
@@ -86,9 +86,9 @@ describe("orderSectionRows", () => {
 		]);
 		const pinned = ["session:c", "session:a"];
 		const first = orderSectionRows(rows, pinned).map((row) => row.summary.sessionId);
-		for (let i = 0; i < 20; i++) {
-			const again = orderSectionRows(rows, pinned).map((row) => row.summary.sessionId);
-			expect(again).toEqual(first);
+		const permutations = [[...rows].reverse(), [rows[2]!, rows[4]!, rows[0]!, rows[3]!, rows[1]!]];
+		for (const permutation of permutations) {
+			expect(orderSectionRows(permutation, pinned).map((row) => row.summary.sessionId)).toEqual(first);
 		}
 	});
 
@@ -224,5 +224,74 @@ describe("orderAgentsViewRoots: section round-trip retention", () => {
 			manualOrder.idle,
 		);
 		expect(ordered.map((row) => row.summary.sessionId)).toEqual(["pinned", "other"]);
+	});
+});
+
+describe("buildAgentsViewRows manual order integration", () => {
+	test("orders top-level roots by identity before emitting an expanded subagent tree", () => {
+		const parent = idleSummary("parent", "2026-01-01T00:00:00Z");
+		const child = makeSummary({
+			id: "child",
+			activeSessionId: "child",
+			sessionId: "child",
+			sessionName: "child",
+			runtimeKind: "subagent",
+			parentSessionId: parent.sessionId,
+			parentActiveSessionId: parent.activeSessionId,
+			activity: "idle",
+		});
+		const other = idleSummary("other", "2026-01-02T00:00:00Z");
+
+		const rows = buildAgentsViewRows([parent, child, other], new Set(["active:parent"]), new Set(), undefined, {
+			idle: ["active:parent", "active:other"],
+		});
+
+		expect(
+			rows
+				.filter((row) => row.kind === "agent" && row.depth === 0)
+				.map((row) => [row.identity, row.summary.sessionId]),
+		).toEqual([
+			["active:parent", "parent"],
+			["active:other", "other"],
+		]);
+		expect(rows.filter((row) => row.kind === "subagent").map((row) => row.summary.sessionId)).toEqual(["child"]);
+	});
+
+	test("leaves a scoped subtree in heuristic order instead of applying global pins", () => {
+		const parent = idleSummary("parent", "2026-01-01T00:00:00Z");
+		const childA = makeSummary({
+			id: "child-a",
+			activeSessionId: "child-a",
+			sessionId: "child-a",
+			sessionName: "child-a",
+			runtimeKind: "subagent",
+			parentSessionId: parent.sessionId,
+			parentActiveSessionId: parent.activeSessionId,
+			activity: "idle",
+			modified: "2026-01-01T00:00:00Z",
+			lastActivityAt: "2026-01-01T00:00:00Z",
+		});
+		const childB = makeSummary({
+			id: "child-b",
+			activeSessionId: "child-b",
+			sessionId: "child-b",
+			sessionName: "child-b",
+			runtimeKind: "subagent",
+			parentSessionId: parent.sessionId,
+			parentActiveSessionId: parent.activeSessionId,
+			activity: "idle",
+			modified: "2026-01-02T00:00:00Z",
+			lastActivityAt: "2026-01-02T00:00:00Z",
+		});
+
+		const rows = buildAgentsViewRows(
+			[parent, childA, childB],
+			new Set(),
+			new Set(),
+			{ sessionId: parent.sessionId, activeSessionId: parent.activeSessionId },
+			{ idle: ["active:child-a", "active:child-b"] },
+		);
+
+		expect(rows.filter((row) => row.depth === 0).map((row) => row.summary.sessionId)).toEqual(["child-b", "child-a"]);
 	});
 });
