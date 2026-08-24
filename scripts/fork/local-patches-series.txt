@@ -26,3 +26,13 @@ feat/sibling-doctrine
 feat/keybind-catalog
 hardening/secrets-scan
 hardening/sync-script
+hardening/swap-script
+hardening/deterministic-build
+fix/daemon-shortcuts
+feat/status-line
+fix/idle-eviction-timeout
+feat/model-catalog-parity
+fix/agents-delete-stale-draft
+feat/wayfinder-tracker-setup
+feat/supervisor-kill-file-fallback
+feat/status-line-parity

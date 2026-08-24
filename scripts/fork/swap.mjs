@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // Fork binary swap procedure (PRD D3/R4). WRITE-ONCE, HUMAN-EXECUTED SCRIPT.
 //
-// Swaps the live `prime-agent` binary from the Homebrew-installed original
-// to this fork's own built bundle, with a one-command rollback path.
+// Swaps the live `prime-agent` binary from the npm-global-installed original
+// (installed under Homebrew's npm prefix, at /opt/homebrew/lib/node_modules/
+// prime-agent -- this is an npm global package with an npm-managed bin
+// symlink, NOT a Homebrew formula; `brew pin`/`brew list --pinned` do not
+// apply to it, confirmed against this machine 2026-08-19 after an initial
+// wrong assumption in the PRD) to this fork's own built bundle, with a
+// one-command rollback path.
 //
 // This script does NOT run automatically as part of any build, check, or
 // commit. It must be invoked explicitly and deliberately, ideally by
@@ -20,14 +25,16 @@
 // flip -> start daemon -> assert client AND daemon report +fork. Rollback
 // mirrors this (kill fork daemon first, then flip back, then restart).
 //
-// R1: the rollback copy is a plain tarball OUTSIDE the Homebrew prefix
-// (`brew cleanup` cannot delete it, unlike a package kept inside the
-// Cellar). `brew pin prime-agent` (or uninstall the Homebrew formula
-// entirely) is a prerequisite for a durable swap -- otherwise a future
-// `brew upgrade` silently reinstalls over the fork. This script does NOT
-// run `brew pin`/`brew uninstall` itself; it checks and reports the current
-// pin state and tells the operator what to do, since that is a one-time,
-// deliberate decision, not something to automate silently.
+// R1: the rollback copy is a plain tarball OUTSIDE the npm global prefix
+// (a directory removal or reinstall of the npm package cannot delete it).
+// There is no Homebrew formula to pin for this package -- it is an npm
+// global install, and npm has no built-in "pin"/"hold" concept the way
+// Homebrew does. The real durability risk is different: running
+// `npm update -g prime-agent` or `npm install -g prime-agent` after the
+// swap would re-link npm's own bin symlink back to the original package,
+// silently undoing the swap. This script does not (and cannot) prevent
+// that npm command from being run; it reports the swap state so the
+// operator can confirm it is still in effect at any time.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readlinkSync, symlinkSync, unlinkSync, cpSync, rmSync, readFileSync, writeFileSync } from "node:fs";
@@ -79,9 +86,14 @@ function reportStatus() {
 	}
 	console.log("Rollback backup: " + ROLLBACK_DIR);
 	console.log("  present: " + existsSync(ROLLBACK_DIR));
-	const brewPin = run("brew", ["list", "--pinned"]);
-	const pinned = (brewPin.stdout || "").split("\n").includes("prime-agent");
-	console.log("Homebrew pin (brew list --pinned): " + (pinned ? "PINNED" : "NOT PINNED -- brew upgrade could silently overwrite the swap"));
+	const npmGlobalList = run("npm", ["list", "-g", "--depth=0"]);
+	const npmManaged = (npmGlobalList.stdout || "").includes("prime-agent@");
+	console.log(
+		"npm global package: " +
+			(npmManaged
+				? "present (this is an npm global install, not a Homebrew formula -- running npm update -g prime-agent or npm install -g prime-agent after the swap would silently undo it; there is no npm pin/hold mechanism to prevent this, only avoiding running those commands)"
+				: "not found via npm list -g -- unexpected, verify manually"),
+	);
 }
 
 function assertDaemonStopped() {
