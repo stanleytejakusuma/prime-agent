@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { Container, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { SessionUsageTracker } from "../../../src/modes/interactive/agent-activity.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 
@@ -53,6 +54,7 @@ function createRenderMode(sessionRecap?: string): RecapRenderMode {
 function createMessageStartMode(): MessageStartMode {
 	return Object.assign(Object.create(InteractiveMode.prototype), {
 		isInitialized: true,
+		sessionUsageTracker: new SessionUsageTracker(),
 		footer: { invalidate: vi.fn() },
 		updateConnectionStateFromEvent: vi.fn(),
 		contextUsageTokenBaseline: 12,

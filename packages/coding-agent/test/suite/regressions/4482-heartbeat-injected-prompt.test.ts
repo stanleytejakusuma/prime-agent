@@ -6,6 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../../src/core/cron-jobs.js";
 import { createGoalContextMessage, type GoalState } from "../../../src/core/goals.js";
 import { createHeartbeatPromptMessage, HEARTBEAT_PROMPT_CUSTOM_TYPE } from "../../../src/core/messages.js";
+import { SessionUsageTracker } from "../../../src/modes/interactive/agent-activity.js";
 import {
 	InjectedPromptMessageComponent,
 	isInjectedPromptMessage,
@@ -77,6 +78,7 @@ function createHeartbeat(): AgentCronJob {
 function createMessageStartMode(sessionRecap = "previous recap"): MessageStartHandleMode {
 	return Object.assign(Object.create(InteractiveMode.prototype), {
 		isInitialized: true,
+		sessionUsageTracker: new SessionUsageTracker(),
 		footer: { invalidate: vi.fn() },
 		updateConnectionStateFromEvent: vi.fn(),
 		contextUsageTokenBaseline: 12,
