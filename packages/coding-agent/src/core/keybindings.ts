@@ -24,6 +24,7 @@ export interface AppKeybindings {
 	"app.messages.expand": true;
 	"app.edits.expand": true;
 	"app.thinking.toggle": true;
+	"app.effort.cycle": true;
 	"app.subagents.focus": true;
 	"app.heartbeats.open": true;
 	"app.heartbeats.openSelected": true;
@@ -97,6 +98,11 @@ export const KEYBINDINGS = {
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
+		defaultKeyScope: "editor",
+	},
+	"app.effort.cycle": {
+		defaultKeys: [],
+		description: "Cycle reasoning effort level",
 		defaultKeyScope: "editor",
 	},
 	"app.subagents.focus": {
