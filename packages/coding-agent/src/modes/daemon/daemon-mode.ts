@@ -1402,34 +1402,37 @@ export class AgentDaemon {
 		activeSessions: ActiveSessionState[],
 		savedSessions: SessionInfo[],
 		scheduledJobs: AgentCronJob[],
+		includeUsageSnapshot = false,
 	): Promise<SessionSummary[]> {
 		const passiveByPath = await this.passiveRlmSubagentsByPath(savedSessions);
 		const savedByPath = new Map(savedSessions.map((session) => [resolve(session.path), session]));
 		for (const [path, passive] of passiveByPath) {
 			savedByPath.set(path, passive.info);
 		}
-		return buildSessionList(activeSessions, [...savedByPath.values()], scheduledJobs).map((summary) => {
-			const passive = summary.sessionFile ? passiveByPath.get(resolve(summary.sessionFile)) : undefined;
-			if (!passive || summary.activeSessionId) return summary;
-			const parentEntry = passive.chain.at(-2);
-			return {
-				...summary,
-				runtimeKind: "subagent",
-				...(passive.chain.length === 1 && passive.rootParentState
-					? { parentActiveSessionId: passive.rootParentState.activeSessionId }
-					: {}),
-				parentSessionId: passive.entry.parentSessionId,
-				parentSessionPath:
-					passive.entry.parentSessionFile ??
-					parentEntry?.sessionFile ??
-					passive.rootParentState?.runtime.session.sessionFile ??
-					passive.rootInfo?.path,
-				rlmDepth: passive.entry.rlmDepth ?? passive.info.rlmDepth,
-				rlmChildId: passive.entry.childId,
-				rlmParentNodeId: passive.entry.rlmParentNodeId ?? passive.entry.childId,
-				spawnCode: passive.entry.spawnCode,
-			};
-		});
+		return buildSessionList(activeSessions, [...savedByPath.values()], scheduledJobs, includeUsageSnapshot).map(
+			(summary) => {
+				const passive = summary.sessionFile ? passiveByPath.get(resolve(summary.sessionFile)) : undefined;
+				if (!passive || summary.activeSessionId) return summary;
+				const parentEntry = passive.chain.at(-2);
+				return {
+					...summary,
+					runtimeKind: "subagent",
+					...(passive.chain.length === 1 && passive.rootParentState
+						? { parentActiveSessionId: passive.rootParentState.activeSessionId }
+						: {}),
+					parentSessionId: passive.entry.parentSessionId,
+					parentSessionPath:
+						passive.entry.parentSessionFile ??
+						parentEntry?.sessionFile ??
+						passive.rootParentState?.runtime.session.sessionFile ??
+						passive.rootInfo?.path,
+					rlmDepth: passive.entry.rlmDepth ?? passive.info.rlmDepth,
+					rlmChildId: passive.entry.childId,
+					rlmParentNodeId: passive.entry.rlmParentNodeId ?? passive.entry.childId,
+					spawnCode: passive.entry.spawnCode,
+				};
+			},
+		);
 	}
 
 	private async findPassiveRlmSubagent(
@@ -3816,9 +3819,19 @@ export class AgentDaemon {
 			case "list": {
 				const activeSessions = Array.from(this.sessions.values());
 				const scheduledJobs = this.cronStore.list();
+				// The usage snapshot is a wire addition; only include it for clients
+				// that explicitly advertised the capability on the list command.
+				const includeUsageSnapshot = normalizeClientCapabilities(command.capabilities, undefined).has(
+					"session_usage_snapshot",
+				);
 				if (!command.all) {
 					return success(command.id, "list", {
-						sessions: await this.buildSessionListWithPassiveRlmSubagents(activeSessions, [], scheduledJobs),
+						sessions: await this.buildSessionListWithPassiveRlmSubagents(
+							activeSessions,
+							[],
+							scheduledJobs,
+							includeUsageSnapshot,
+						),
 					});
 				}
 				const defaultConfig = this.options.defaultSessionConfig;
@@ -3830,6 +3843,7 @@ export class AgentDaemon {
 							activeSessions,
 							savedSessions,
 							scheduledJobs,
+							includeUsageSnapshot,
 						),
 					});
 				}
@@ -3842,6 +3856,7 @@ export class AgentDaemon {
 						activeSessions,
 						savedSessions,
 						scheduledJobs,
+						includeUsageSnapshot,
 					),
 				});
 			}

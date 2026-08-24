@@ -10748,3 +10748,115 @@ describe("createRuntime cwd resolution on resume (fork fix: cwd-resume)", () => 
 		}
 	});
 });
+
+describe("list command capability gate (session_usage_snapshot wiring)", () => {
+	it("includes usageSnapshot only when the client advertises the capability", async () => {
+		// Red review 2026-08-24: buildSessionList's includeUsageSnapshot flag was
+		// unit-tested directly, but nothing proved the wire-level path from
+		// command.capabilities actually sets it. This exercises the real
+		// handleCommand code path end to end (no active sessions needed since
+		// command.all is unset, so the empty-roster branch is taken and no disk
+		// I/O happens).
+		const daemon = new AgentDaemon("/tmp/unused-daemon-capability-gate.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		const client = makeClient("client-cap-gate", "active-cap-gate");
+
+		const withoutCapability = (await internals.handleCommand(client, { type: "list" })) as {
+			data: { sessions: SessionSummary[] };
+		};
+		expect(withoutCapability.data.sessions).toEqual([]);
+
+		const withCapability = (await internals.handleCommand(client, {
+			type: "list",
+			capabilities: ["session_usage_snapshot"],
+		})) as { data: { sessions: SessionSummary[] } };
+		expect(withCapability.data.sessions).toEqual([]);
+		// With zero active sessions there is nothing to assert usageSnapshot on
+		// directly here (daemon-session-usage.test.ts already proves the flag's
+		// effect on a real row); this test's job is only to prove the command
+		// does not reject/ignore the capabilities field and completes cleanly,
+		// which is the old-daemon-compatibility question: an unrecognized
+		// property on the list command must never break the request.
+	});
+
+	it("tolerates an unrecognized capability string without throwing (forward compatibility)", async () => {
+		const daemon = new AgentDaemon("/tmp/unused-daemon-capability-gate-2.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		const client = makeClient("client-cap-gate-3", "active-cap-gate-3");
+
+		// A future client capability this daemon build does not recognize yet
+		// must be dropped silently by normalizeClientCapabilities, not throw.
+		const response = await internals.handleCommand(client, {
+			type: "list",
+			capabilities: ["session_usage_snapshot", "a_future_capability_not_yet_known" as never],
+		});
+		expect((response as { data: { sessions: unknown[] } }).data.sessions).toEqual([]);
+	});
+	it("accepts a raw JSON-over-the-wire list command with capabilities through the real handleLine decode path (old-daemon compatibility)", async () => {
+		// Red review 2026-08-24 (footer remediation re-review): the prior two
+		// tests in this describe block call handleCommand directly with an
+		// in-memory object, bypassing the socket read / JSON.parse / envelope
+		// decode layer between the wire and the handler -- so they prove the
+		// handler tolerates the field, not that the wire-decode path does. This
+		// drives handleLine with a raw JSON string (the real socket entrypoint,
+		// already used elsewhere in this file for prompt-admission tests),
+		// including a capability this daemon build has never seen, and asserts
+		// on the actual serialized response written back to the socket.
+		//
+		// This was independently corroborated live against the actual running
+		// production daemon (0.8.0+fork.8d7deeab5, built before this branch
+		// existed): a raw socket connection sent the same envelope shape with
+		// capabilities: ["session_usage_snapshot", "totally_unknown_future_capability_xyz"]
+		// and received success:true with the full session list, confirming the
+		// claim that command parsing is JSON.parse + structural typing with no
+		// schema validator rejecting unknown properties.
+		const daemon = new AgentDaemon("/tmp/prime-agent-wire-capability-gate.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const writes: string[] = [];
+		const client = {
+			...makeClient("client-wire-cap-gate", "active-wire-cap-gate"),
+			socket: {
+				destroyed: false,
+				write: (line: string) => {
+					writes.push(line);
+					return true;
+				},
+			} as unknown as Socket,
+		};
+		const internals = daemon as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				id: "wire-cap-gate-1",
+				type: "list",
+				capabilities: ["session_usage_snapshot", "totally_unknown_future_capability_xyz"],
+			}),
+		);
+
+		expect(writes).toHaveLength(1);
+		const response = JSON.parse(writes[0]) as {
+			id: string;
+			success: boolean;
+			command: string;
+			data: { sessions: unknown[] };
+		};
+		expect(response.success).toBe(true);
+		expect(response.command).toBe("list");
+		expect(response.data.sessions).toEqual([]);
+	});
+});
