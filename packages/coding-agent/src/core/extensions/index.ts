@@ -23,7 +23,7 @@ export type {
 	ShutdownHandler,
 	SwitchSessionHandler,
 } from "./runner.js";
-export { ExtensionRunner } from "./runner.js";
+export { ExtensionRunner, resolveExtensionShortcutDescriptors } from "./runner.js";
 export type {
 	AfterProviderResponseEvent,
 	AgentEndEvent,
@@ -65,6 +65,7 @@ export type {
 	ExtensionHandler,
 	ExtensionRuntime,
 	ExtensionShortcut,
+	ExtensionShortcutDescriptor,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,

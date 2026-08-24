@@ -94,6 +94,15 @@ export async function bindActiveSessionState(
 			});
 		},
 	});
+
+	// This function runs on daemon startup, /reload, and every subagent spawn
+	// (see the comment above bindActiveSessionState's caller). Extension
+	// shortcuts may have changed on any of those paths, so already-attached
+	// daemon clients need to re-fetch their client-side shortcut registry.
+	callbacks.broadcast(state, {
+		type: "extension_shortcuts_changed",
+		activeSessionId: state.activeSessionId,
+	});
 }
 
 function createCommandContextActions(state: ActiveSessionState): ExtensionCommandContextActions {

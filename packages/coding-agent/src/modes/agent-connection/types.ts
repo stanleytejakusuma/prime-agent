@@ -433,6 +433,18 @@ export interface AgentConnectionResourceSnapshot {
 	diagnostics: AgentConnectionResourceDiagnostics;
 }
 
+/**
+ * Serializable descriptor for a daemon-hosted extension shortcut (Option B of
+ * the daemon-shortcuts fix). Mirrors ExtensionShortcutDescriptor without a
+ * dependency on core/extensions/types.js -- the agent-connection layer stays
+ * decoupled from the extension runtime's internal types.
+ */
+export interface AgentConnectionExtensionShortcut {
+	key: string;
+	description?: string;
+	extensionPath: string;
+}
+
 export interface AgentConnectionToolDefinition {
 	name: string;
 	label: string;
@@ -629,6 +641,7 @@ export type AgentConnectionEvent =
 	| { type: "extension_error"; extensionPath: string; event: string; error: string }
 	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
 	| { type: "heartbeats_changed" }
+	| { type: "extension_shortcuts_changed" }
 	| { type: "closed"; error?: string };
 
 export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;
@@ -699,6 +712,20 @@ export interface AgentConnection {
 	getLastAssistantText(): Promise<string | undefined>;
 	getSystemPrompt(): Promise<string>;
 	getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined>;
+	/**
+	 * Raw, unresolved extension-declared shortcuts (no built-in keybinding
+	 * conflict resolution -- callers apply that locally, same as local mode).
+	 * Returns an empty list against a daemon that predates the
+	 * "extension_shortcuts" capability instead of throwing.
+	 */
+	getExtensionShortcuts(): Promise<AgentConnectionExtensionShortcut[]>;
+	/**
+	 * Fire-and-forget execution trigger for a shortcut a client already matched
+	 * locally. Both its normalized key and opaque extension identity must still
+	 * match the daemon's current winning record. Resolves once the daemon has
+	 * dispatched the handler (without awaiting it), not once it has finished.
+	 */
+	runExtensionShortcut(key: string, extensionPath: string): Promise<void>;
 	setSessionEntryLabel(entryId: string, label: string | undefined): Promise<void>;
 	respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void>;
 	supportsAcpMcpServers?(): boolean;

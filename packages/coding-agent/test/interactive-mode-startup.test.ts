@@ -29,6 +29,16 @@ describe("InteractiveMode startup hints", () => {
 				model: { name: "test-model", reasoning: true },
 				thinkingLevel: "high",
 			},
+			// getHotkeysGuide() branches on this to pick local vs. daemon-sourced
+			// shortcuts (Option B of the daemon-shortcuts fix); these tests exercise
+			// the local-session path, which reads live from a real ExtensionRunner.
+			bindLocalSessionExtensions: true,
+			getLocalSessionHost: () => ({
+				getExtensionRunner: () => ({
+					getShortcuts: () => new Map(),
+				}),
+			}),
+			keybindings: { getEffectiveConfig: () => ({}) },
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 		return mode;

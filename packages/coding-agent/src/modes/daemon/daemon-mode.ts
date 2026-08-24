@@ -13,6 +13,7 @@ import { readFile, stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
+import type { KeyId } from "@earendil-works/pi-tui";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
@@ -338,6 +339,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_last_assistant_text",
 	"get_system_prompt",
 	"get_tool_definition",
+	"get_extension_shortcuts",
+	"run_extension_shortcut",
 	"set_session_entry_label",
 	"extension_ui_response",
 	"prepare_update_restart",
@@ -5002,6 +5005,40 @@ export class AgentDaemon {
 						state.runtime.session.getToolDefinition(command.name),
 					),
 				});
+			}
+
+			case "get_extension_shortcuts": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_extension_shortcuts", {
+					shortcuts: state.runtime.session.extensionRunner.getRawShortcuts(),
+				});
+			}
+
+			case "run_extension_shortcut": {
+				const state = this.getSessionState(command.activeSessionId);
+				const shortcut = state.runtime.session.extensionRunner.findShortcutByKeyAndExtensionPath(
+					command.key as KeyId,
+					command.extensionPath,
+				);
+				if (!shortcut) {
+					return success(command.id, "run_extension_shortcut", { found: false });
+				}
+				const context = state.runtime.session.extensionRunner.createContext();
+				// Fire-and-forget, matching local mode's synchronous input contract.
+				// The .then boundary is deliberate: Promise.resolve(handler(context))
+				// would evaluate handler(context) first, so a synchronous throw would
+				// escape the command instead of travelling through emitError.
+				void Promise.resolve()
+					.then(() => shortcut.handler(context))
+					.catch((error: unknown) => {
+						state.runtime.session.extensionRunner.emitError({
+							extensionPath: shortcut.extensionPath,
+							event: "shortcut",
+							error: error instanceof Error ? error.message : String(error),
+							stack: error instanceof Error ? error.stack : undefined,
+						});
+					});
+				return success(command.id, "run_extension_shortcut", { found: true });
 			}
 
 			case "set_session_entry_label": {

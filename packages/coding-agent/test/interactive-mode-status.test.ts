@@ -3139,6 +3139,13 @@ describe("InteractiveMode session switch command catalog", () => {
 				connectionCommands: await connection.getCommands(),
 				connectionModelsRefreshVersion: 0,
 				bindLocalSessionExtensions: false,
+				// rebindCurrentSession()'s daemon-client branch (Option B of the
+				// daemon-shortcuts fix) touches these; a real InteractiveMode always
+				// has them from its constructor, so a faithful fake needs them too.
+				defaultEditor: { onExtensionShortcut: undefined as ((data: string) => boolean) | undefined },
+				daemonExtensionShortcuts: new Map(),
+				daemonExtensionShortcutGeneration: 0,
+				keybindings: { getEffectiveConfig: () => ({}) },
 				uiServices: { getThemes: () => [] },
 				toolDefinitionCache: { clear: vi.fn() },
 				applyRuntimeSettings: vi.fn(),
