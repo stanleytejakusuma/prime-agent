@@ -434,6 +434,76 @@ describe("RlmWorktreeLifecycleManager", () => {
 		expect(existsSync(admission.worktreePath)).toBe(false);
 	});
 
+	it("clears a stale index.lock only inside the worktree's own gitdir, never the shared common dir (R1)", async () => {
+		// Red review (final), R1: a linked worktree's index.lock lives at
+		// <gitCommonDir>/worktrees/<name>/index.lock, NOT <gitCommonDir>/index.lock
+		// (the MAIN checkout's lock). Clearing the common-dir lock could destroy a
+		// live lock held by an unrelated concurrent operation in the main
+		// checkout -- the one place this feature could reach outside its own
+		// namespace.
+		const admission = await admit();
+		writeFileSync(join(admission.worktreePath, "packages", "sub", "dirty.txt"), "dirty\n");
+
+		// Plant a decoy lock in the MAIN checkout's common dir, simulating a live
+		// concurrent operation there. It must survive untouched.
+		const mainLock = join(admission.gitCommonDir, "index.lock");
+		writeFileSync(mainLock, "");
+		// Plant the REAL stale lock inside the worktree's own gitdir.
+		const ownGitDir = git(admission.worktreePath, "rev-parse", "--git-dir").trim();
+		const resolvedOwnGitDir = ownGitDir.startsWith("/") ? ownGitDir : join(admission.worktreePath, ownGitDir);
+		const ownLock = join(resolvedOwnGitDir, "index.lock");
+		writeFileSync(ownLock, "");
+
+		try {
+			const entry = await manager.finalizeWorktree({
+				parentSessionId,
+				childId,
+				repoRoot: admission.repoRoot,
+				gitCommonDir: admission.gitCommonDir,
+				isChildLive: () => false,
+			});
+			// The stale lock inside the worktree's own gitdir was cleared and the
+			// WIP commit succeeded on retry.
+			expect(entry.outcome).toBe("reaped");
+			expect(entry.wipPinned).toBe(true);
+			// The decoy lock in the MAIN checkout was never touched.
+			expect(existsSync(mainLock)).toBe(true);
+		} finally {
+			rmSync(mainLock, { force: true });
+		}
+	});
+
+	it("catches a live process nested deep in the worktree tree (lsof +D, not +d)", async () => {
+		// Red review (final), R2: "+d" only inspects the directory and its
+		// IMMEDIATE top-level entries. A process whose cwd is nested (a dev
+		// server under packages/app, a test watcher holding files under
+		// node_modules) is invisible to "+d" but must still block removal. "+D"
+		// recurses.
+		const admission = await admit();
+		const nestedDir = join(admission.worktreePath, "packages", "sub", "deeply", "nested");
+		mkdirSync(nestedDir, { recursive: true });
+		const proc = spawn(process.execPath, ["-e", "setTimeout(() => {}, 15000)"], {
+			cwd: nestedDir,
+			stdio: "ignore",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		try {
+			const entry = await manager.finalizeWorktree({
+				parentSessionId,
+				childId,
+				repoRoot: admission.repoRoot,
+				gitCommonDir: admission.gitCommonDir,
+				isChildLive: () => false,
+			});
+			expect(entry.outcome).toBe("cleanup_failed");
+			expect(entry.error).toContain("processes still hold cwd");
+			expect(existsSync(admission.worktreePath)).toBe(true);
+		} finally {
+			proc.kill("SIGKILL");
+			await new Promise((resolve) => setTimeout(resolve, 300));
+		}
+	});
+
 	it("reconcile adopts live children and reaps dead ones", async () => {
 		const admission = await admit();
 		const params = {

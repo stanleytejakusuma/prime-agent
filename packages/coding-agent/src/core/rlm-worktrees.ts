@@ -879,9 +879,9 @@ export class RlmWorktreeLifecycleManager {
 		}
 		const commitArgs = [
 			"-c",
-			'user.name="RLM Worktree Cleanup"',
+			"user.name=RLM Worktree Cleanup",
 			"-c",
-			'user.email="rlm@prime-agent.local"',
+			"user.email=rlm@prime-agent.local",
 			"-c",
 			"commit.gpgsign=false",
 			"-c",
@@ -896,9 +896,17 @@ export class RlmWorktreeLifecycleManager {
 		try {
 			await attempt();
 		} catch (error) {
-			const staleIndexLock = join(gitCommonDir, "index.lock");
-			if (existsSync(staleIndexLock)) {
-				// Termination is confirmed, so an index lock is stale by definition.
+			// Red review (final): a linked worktree's index lock lives at
+			// <gitCommonDir>/worktrees/<name>/index.lock, NOT <gitCommonDir>/index.lock
+			// (that path is the MAIN checkout's lock). Clearing the common-dir lock
+			// could destroy a live lock held by an unrelated concurrent operation in
+			// the main checkout -- the one place this feature could reach outside its
+			// own namespace. Resolve the worktree's OWN git-dir first and only ever
+			// clear a stale lock inside that directory.
+			const staleIndexLock = await this.resolveWorktreeIndexLockPath(record.worktreePath, gitCommonDir);
+			if (staleIndexLock && existsSync(staleIndexLock)) {
+				// Termination is confirmed, so a lock inside THIS worktree's own gitdir
+				// is stale by definition; a lock outside it is never touched.
 				rmSync(staleIndexLock, { force: true });
 				try {
 					await attempt();
@@ -925,17 +933,56 @@ export class RlmWorktreeLifecycleManager {
 		return { status: "pinned", pinned: true };
 	}
 
+	/**
+	 * Resolve the git-dir that belongs to THIS worktree specifically (never the
+	 * shared common dir), so a stale index.lock is only ever cleared inside the
+	 * worktree's own state, never a lock another process (including the parent
+	 * checkout) may still legitimately hold.
+	 */
+	private async resolveWorktreeIndexLockPath(worktreePath: string, gitCommonDir: string): Promise<string | undefined> {
+		try {
+			const result = await runGit(worktreePath, ["rev-parse", "--git-dir"]);
+			const raw = result.stdout.trim();
+			if (!raw) return undefined;
+			const resolved = raw.startsWith(sep) ? raw : join(worktreePath, raw);
+			const canonical = canonicalizePath(resolved);
+			// Defense in depth: a linked worktree's own git-dir must live under the
+			// shared common dir's "worktrees/" subtree, never equal the common dir
+			// itself. If it does not, refuse to touch any lock there at all.
+			if (canonical === canonicalizePath(gitCommonDir) || !canonical.includes(`${sep}worktrees${sep}`)) {
+				return undefined;
+			}
+			return join(canonical, "index.lock");
+		} catch {
+			return undefined;
+		}
+	}
+
 	private async hasLiveProcessInWorktree(worktreePath: string): Promise<boolean> {
 		if (!existsSync(worktreePath)) {
 			return false;
 		}
-		const result = await execCommand("lsof", ["+d", worktreePath], "/", {
+		// Red review (final): "+d" only inspects the directory and its immediate
+		// top-level entries, so a process with cwd or open files deeper in the
+		// tree (a background dev server, a test watcher holding files under
+		// node_modules) is invisible -- the "never remove a worktree with live
+		// processes" invariant was not actually enforced. "+D" recurses.
+		const result = await execCommand("lsof", ["+D", worktreePath], "/", {
 			timeout: lsofTimeoutMs(),
 		});
 		if (result.killed) {
-			throw new Error(`lsof +d ${worktreePath} timed out`);
+			throw new Error(`lsof +D ${worktreePath} timed out`);
 		}
-		// lsof exits 1 with empty output when no process uses the directory.
+		// lsof exits 1 with empty output/stderr when no process uses the tree; a
+		// nonzero exit WITH stderr, or a missing binary, is a broken probe, not a
+		// clean answer -- fail closed (treat as live) rather than silently
+		// degrading the backstop to a no-op.
+		if (result.code !== 0 && result.code !== 1) {
+			throw new Error(`lsof +D ${worktreePath} failed (exit ${result.code}): ${result.stderr.trim()}`);
+		}
+		if (result.code === 1 && result.stderr.trim()) {
+			throw new Error(`lsof +D ${worktreePath} errored: ${result.stderr.trim()}`);
+		}
 		return result.stdout.trim().length > 0;
 	}
 
@@ -1207,31 +1254,54 @@ export class RlmWorktreeLifecycleManager {
 					}
 					const live = [...rawParentSessionIds].some((id) => params.isSessionLive(id));
 					if (live) continue;
-					for (const record of records) {
-						const identityOk = await verifyRepoIdentity(record.repoRoot, record.gitCommonDir);
-						const pathOk =
-							canonicalizePath(record.worktreePath) === canonicalizePath(join(namespaceDir, record.childId));
-						if (!identityOk || !pathOk) {
-							this.quarantineRecord(namespaceDir, record.childId);
-							log.error(
-								`[rlm-worktrees] Host sweep quarantined record for ${record.childId}; never executed against`,
-							);
-							report.push({
-								childId: record.childId,
-								branch: record.branch,
-								wipPinned: false,
-								outcome: "quarantined",
-							});
-							continue;
-						}
-						const reaped = await this.finalizeWorktreeLocked(
-							namespaceDir,
-							record.childId,
-							record.repoRoot,
-							record.gitCommonDir,
-							() => false,
-						);
-						report.push(reaped);
+					// Red review (final): the host sweep previously held only the global
+					// lock and finalized directly, with no mutual exclusion against a
+					// session-side finalize/reconcile on the same namespace (those hold
+					// only the session lock). Two processes could finalize the same child
+					// concurrently: double WIP attempts, spurious CLEANUP_FAILED against an
+					// already-deleted record, misleading reports. Nest the session lock
+					// inside the already-held global lock, per record's own
+					// parentSessionId, matching the established global -> session order.
+					const repoKeyForLock = deriveRlmWorktreeRepoKey(
+						records[0]?.repoRoot ?? "",
+						records[0]?.gitCommonDir ?? "",
+					);
+					for (const parentSessionId of rawParentSessionIds) {
+						await withProperLock(this.sessionLockPath(repoKeyForLock, parentSessionId), async () => {
+							for (const record of records.filter(
+								(candidate) => candidate.parentSessionId === parentSessionId,
+							)) {
+								const identityOk = await verifyRepoIdentity(record.repoRoot, record.gitCommonDir);
+								const pathOk =
+									canonicalizePath(record.worktreePath) ===
+									canonicalizePath(join(namespaceDir, record.childId));
+								// Defense in depth: the enumerated repoKey directory name must match
+								// the record's own identity hash, so a tampered record cannot point
+								// this sweep's git operations at a foreign repository.
+								const repoKeyOk = deriveRlmWorktreeRepoKey(record.repoRoot, record.gitCommonDir) === repoKey;
+								if (!identityOk || !pathOk || !repoKeyOk) {
+									this.quarantineRecord(namespaceDir, record.childId);
+									log.error(
+										`[rlm-worktrees] Host sweep quarantined record for ${record.childId}; never executed against`,
+									);
+									report.push({
+										childId: record.childId,
+										branch: record.branch,
+										wipPinned: false,
+										outcome: "quarantined",
+									});
+									continue;
+								}
+								const reaped = await this.finalizeWorktreeLocked(
+									namespaceDir,
+									record.childId,
+									record.repoRoot,
+									record.gitCommonDir,
+									() => false,
+								);
+								report.push(reaped);
+							}
+						});
 					}
 				}
 			}
