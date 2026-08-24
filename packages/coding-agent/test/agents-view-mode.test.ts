@@ -440,6 +440,7 @@ describe("AgentsViewMode", () => {
 			scopeKey: persistentState.scopeFrames?.[0]?.scope,
 			expandedSubagentParents: new Set(),
 			programShownParents: new Set(),
+			manualOrder: {},
 			editor: { getText: () => "" },
 			getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
 			applyPendingAncestorExpansion: vi.fn(),
@@ -478,6 +479,104 @@ describe("AgentsViewMode", () => {
 		expect(persistentState.scopeFrames).toHaveLength(1);
 	});
 
+	it("retains unresolved manual pins until both full catalogs are complete", () => {
+		const buildSelf = (liveCatalogComplete: boolean, savedCatalogComplete: boolean) => {
+			const manualOrder = { idle: ["active:not-yet-streamed"] };
+			const persistentState: AgentsViewPersistentState = { manualOrder };
+			const self: Record<string, unknown> = {
+				persistentState,
+				lastListedSummaries: [],
+				savedSessions: [],
+				heartbeats: [],
+				inactiveAgentIdentities: new Set(),
+				pendingDeleteAgent: undefined,
+				// Ready can be set after a terminal fetch failure. It must not make
+				// an incomplete roster eligible for destructive pruning.
+				liveCatalogReady: true,
+				savedCatalogReady: true,
+				liveCatalogComplete,
+				savedCatalogComplete,
+				expandedSubagentParents: new Set(),
+				programShownParents: new Set(),
+				manualOrder,
+				editor: { getText: () => "" },
+				getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
+				applyPendingAncestorExpansion: vi.fn(),
+				restoreSelection: vi.fn(),
+				ui: { requestRender: vi.fn() },
+				setStatusMessage: vi.fn(),
+				withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			};
+			return { self, persistentState };
+		};
+
+		for (const [liveCatalogComplete, savedCatalogComplete] of [
+			[false, true],
+			[true, false],
+		] as const) {
+			const { self, persistentState } = buildSelf(liveCatalogComplete, savedCatalogComplete);
+			invoke("reconcileCatalogs", self);
+			expect(self.manualOrder).toEqual({ idle: ["active:not-yet-streamed"] });
+			expect(persistentState.manualOrder).toBe(self.manualOrder);
+		}
+
+		const { self } = buildSelf(true, true);
+		invoke("reconcileCatalogs", self);
+		expect(self.manualOrder).toEqual({});
+	});
+
+	it("wires manualOrder through the real reconcileCatalogs production path into emitted rows", () => {
+		// Closes the review gap left by unit tests that call buildAgentsViewRows()
+		// directly: this invokes the real reconcileCatalogs (no stub), the same
+		// method refreshSessions/refreshSavedSessions call in production, and
+		// asserts the manual pin actually reorders this.rows.
+		const older = summary({
+			id: "older",
+			activeSessionId: "older",
+			sessionId: "older-session",
+			sessionFile: "/tmp/older.jsonl",
+			lastActivityAt: "2026-01-01T00:00:00Z",
+		});
+		const newer = summary({
+			id: "newer",
+			activeSessionId: "newer",
+			sessionId: "newer-session",
+			sessionFile: "/tmp/newer.jsonl",
+			lastActivityAt: "2026-01-02T00:00:00Z",
+		});
+		const manualOrder = { idle: [getAgentsViewSummaryIdentity(older), getAgentsViewSummaryIdentity(newer)] };
+		const persistentState: AgentsViewPersistentState = { manualOrder };
+		const self: Record<string, unknown> = {
+			persistentState,
+			lastListedSummaries: [newer, older],
+			savedSessions: [],
+			heartbeats: [],
+			inactiveAgentIdentities: new Set(),
+			pendingDeleteAgent: undefined,
+			liveCatalogReady: true,
+			savedCatalogReady: true,
+			liveCatalogComplete: true,
+			savedCatalogComplete: true,
+			expandedSubagentParents: new Set(),
+			programShownParents: new Set(),
+			manualOrder,
+			editor: { getText: () => "" },
+			getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
+			applyPendingAncestorExpansion: vi.fn(),
+			restoreSelection: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			setStatusMessage: vi.fn(),
+			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+		};
+
+		invoke("reconcileCatalogs", self);
+
+		// Without the manual pin, heuristic ordering would surface `newer` first
+		// (more recent activity). The pin must win through the real production path.
+		const rows = Reflect.get(self, "rows") as AgentsViewRow[];
+		expect(rows.map((row) => row.summary.sessionId)).toEqual(["older-session", "newer-session"]);
+	});
+
 	it("carries the resolved scope root across view remounts", () => {
 		const root = summary({ sessionName: "Scoped root" });
 		const persistentState: AgentsViewPersistentState = {
@@ -495,6 +594,7 @@ describe("AgentsViewMode", () => {
 			scopeKey: persistentState.scopeFrames?.[0]?.scope,
 			expandedSubagentParents: new Set(),
 			programShownParents: new Set(),
+			manualOrder: {},
 			editor: { getText: () => "" },
 			getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
 			applyPendingAncestorExpansion: vi.fn(),
@@ -582,6 +682,7 @@ describe("AgentsViewMode", () => {
 				savedCatalogReady: true,
 				expandedSubagentParents,
 				programShownParents: new Set(),
+				manualOrder: {},
 				editor: { getText: () => "" },
 				getFilteredRecords: () => Reflect.get(self, "scopedRecords"),
 				applyPendingAncestorExpansion: vi.fn(),
@@ -654,6 +755,298 @@ describe("AgentsViewMode", () => {
 	});
 });
 
+describe("AgentsViewMode manual reorder", () => {
+	beforeAll(() => setKeybindings(new KeybindingsManager()));
+
+	function agentRow(overrides: Partial<AgentsViewRow> & { identity: string }): AgentsViewRow {
+		return {
+			kind: "agent",
+			section: "idle",
+			summary: summary({
+				id: overrides.identity,
+				activeSessionId: overrides.identity,
+				sessionId: overrides.identity,
+			}),
+			title: overrides.identity,
+			subtitle: "",
+			statusLabel: "",
+			depth: 0,
+			selectable: true,
+			runningSubagentCount: 0,
+			...overrides,
+		};
+	}
+
+	function subagentRow(identity: string, parentIdentity: string, section: AgentsViewRow["section"]): AgentsViewRow {
+		return {
+			kind: "subagent",
+			section,
+			summary: summary({ id: identity, activeSessionId: identity, sessionId: identity, runtimeKind: "subagent" }),
+			title: identity,
+			subtitle: "",
+			statusLabel: "",
+			depth: 1,
+			selectable: true,
+			runningSubagentCount: 0,
+			identity,
+			parentIdentity,
+		};
+	}
+
+	function moveHarness(rows: AgentsViewRow[], selectedIndex: number, manualOrder: Record<string, string[]> = {}) {
+		const self: Record<string, unknown> = {
+			rows,
+			selectedIndex,
+			manualOrder,
+			persistentState: {},
+			rebuildRows: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+		return self;
+	}
+
+	it("does not reorder or reset within a scoped frame", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" })];
+		const self: Record<string, unknown> = {
+			...moveHarness(rows, 1, { idle: ["a", "b"] }),
+			scopeKey: { sessionId: "scope-root", activeSessionId: "scope-root" },
+		};
+
+		invoke("moveSelectedAgent", self, "earlier");
+		invoke("resetSelectedAgentSectionOrder", self);
+
+		expect(self.manualOrder).toEqual({ idle: ["a", "b"] });
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("moves the selected agent earlier and swaps identities in manualOrder, seeded from current display order", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" }), agentRow({ identity: "c" })];
+		const self = moveHarness(rows, 1); // select "b"
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({ idle: ["b", "a", "c"] });
+		expect(self.rebuildRows).toHaveBeenCalledOnce();
+		expect((self.persistentState as { manualOrder?: unknown }).manualOrder).toBe(self.manualOrder);
+	});
+
+	it("moves the selected agent later and swaps identities in manualOrder", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" }), agentRow({ identity: "c" })];
+		const self = moveHarness(rows, 1); // select "b"
+
+		invoke("moveSelectedAgent", self, "later");
+
+		expect(self.manualOrder).toEqual({ idle: ["a", "c", "b"] });
+	});
+
+	it("is a no-op at the top of the section (shift/alt+up on the first row)", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" })];
+		const self = moveHarness(rows, 0); // select "a", already first
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("is a no-op at the bottom of the section (alt+down on the last row)", () => {
+		const rows = [agentRow({ identity: "a" }), agentRow({ identity: "b" })];
+		const self = moveHarness(rows, 1); // select "b", already last
+
+		invoke("moveSelectedAgent", self, "later");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("skips nested subagent rows and lands the swap on the next top-level agent row", () => {
+		// a (agent) / a's subagent (nested) / b (agent): moving b earlier must
+		// swap with a, not with a's nested subagent row.
+		const rows = [agentRow({ identity: "a" }), subagentRow("a-child", "a", "idle"), agentRow({ identity: "b" })];
+		const self = moveHarness(rows, 2); // select "b"
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({ idle: ["b", "a"] });
+	});
+
+	it("only reorders within the selected row's own section", () => {
+		const rows = [
+			agentRow({ identity: "running-a", section: "running" }),
+			agentRow({ identity: "idle-a", section: "idle" }),
+			agentRow({ identity: "idle-b", section: "idle" }),
+		];
+		const self = moveHarness(rows, 2); // select idle-b
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({ idle: ["idle-b", "idle-a"] });
+	});
+
+	it("does not move a subagent row or a nested-summary row (top-level agent rows only)", () => {
+		const rows = [agentRow({ identity: "a" }), subagentRow("a-child", "a", "idle")];
+		const self = moveHarness(rows, 1); // select the subagent row
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("TOCTOU: no-ops when the selected row disappeared from `rows` before the keypress applied", () => {
+		// Simulates a refreshSessions() landing between the keypress being queued
+		// and moveSelectedAgent running: selectedIndex points past the end of a
+		// now-shorter rows array.
+		const rows = [agentRow({ identity: "a" })];
+		const self = moveHarness(rows, 5);
+
+		invoke("moveSelectedAgent", self, "earlier");
+
+		expect(self.manualOrder).toEqual({});
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("resets manual order for only the selected row's section", () => {
+		const rows = [agentRow({ identity: "a", section: "idle" }), agentRow({ identity: "b", section: "running" })];
+		const self = moveHarness(rows, 0, { idle: ["active:z"], running: ["active:y"] });
+
+		invoke("resetSelectedAgentSectionOrder", self);
+
+		expect(self.manualOrder).toEqual({ running: ["active:y"] });
+		expect(self.rebuildRows).toHaveBeenCalledOnce();
+	});
+
+	it("reset is a no-op when the selected section has no manual order", () => {
+		const rows = [agentRow({ identity: "a", section: "idle" })];
+		const self = moveHarness(rows, 0, { running: ["active:y"] });
+
+		invoke("resetSelectedAgentSectionOrder", self);
+
+		expect(self.manualOrder).toEqual({ running: ["active:y"] });
+		expect(self.rebuildRows).not.toHaveBeenCalled();
+	});
+
+	it("dispatches the real default terminal sequences for move earlier, move later, and reset", () => {
+		const moveSelectedAgent = vi.fn();
+		const resetSelectedAgentSectionOrder = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: undefined,
+			scopeKey: undefined,
+			editor: { getText: () => "" },
+			keybindings: new KeybindingsManager(),
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			resetSelectedAgentSectionOrder,
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A"); // xterm alt+up
+		invoke("handleInput", self, "\x1b[1;3B"); // xterm alt+down
+		invoke("handleInput", self, "\x1br"); // legacy terminal alt+r
+
+		expect(moveSelectedAgent).toHaveBeenNthCalledWith(1, "earlier");
+		expect(moveSelectedAgent).toHaveBeenNthCalledWith(2, "later");
+		expect(resetSelectedAgentSectionOrder).toHaveBeenCalledOnce();
+	});
+
+	it("does not dispatch reorder actions from a scoped frame", () => {
+		const moveSelectedAgent = vi.fn();
+		const resetSelectedAgentSectionOrder = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: undefined,
+			scopeKey: { sessionId: "scope-root", activeSessionId: "scope-root" },
+			editor: { getText: () => "", handleInput: vi.fn() },
+			keybindings: new KeybindingsManager(),
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			resetSelectedAgentSectionOrder,
+			handleListNavigation: vi.fn(() => true),
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A");
+		invoke("handleInput", self, "\x1br");
+
+		expect(moveSelectedAgent).not.toHaveBeenCalled();
+		expect(resetSelectedAgentSectionOrder).not.toHaveBeenCalled();
+	});
+
+	it("handleInput does not dispatch reorder while the search box has text (filter active)", () => {
+		const moveSelectedAgent = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: undefined,
+			editor: { getText: () => "filtering", handleInput: vi.fn() },
+			keybindings: {
+				matches: (_d: string, action: string) => action === "app.agents.moveEarlier",
+			},
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			handleListNavigation: vi.fn(() => false),
+			queryChanged: vi.fn(),
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A");
+		expect(moveSelectedAgent).not.toHaveBeenCalled();
+	});
+
+	it("handleInput does not dispatch reorder while a reply composer is armed", () => {
+		const moveSelectedAgent = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor: { getText: () => "", handleInput: vi.fn() },
+			keybindings: {
+				matches: (_d: string, action: string) => action === "app.agents.moveEarlier",
+			},
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			moveSelectedAgent,
+			handleListNavigation: vi.fn(() => false),
+			queryChanged: vi.fn(),
+		};
+
+		invoke("handleInput", self, "\x1b[1;3A");
+		expect(moveSelectedAgent).not.toHaveBeenCalled();
+	});
+
+	it("renderHints shows the reorder hint only for a top-level agent row with an empty search box", () => {
+		const buildSelf = (row: AgentsViewRow | undefined, queryText: string) => ({
+			isCtrlCExitHintVisible: () => false,
+			statusMessage: undefined,
+			renameTarget: undefined,
+			replyTarget: undefined,
+			rows: row ? [row] : [],
+			selectedIndex: 0,
+			editor: { getText: () => queryText },
+			selectedRowCanShowProgram: () => false,
+		});
+
+		const agentHints = invoke("renderHints", buildSelf(agentRow({ identity: "a" }), ""), 200) as string;
+		expect(agentHints).toContain("reorder");
+
+		const filteredHints = invoke("renderHints", buildSelf(agentRow({ identity: "a" }), "query"), 200) as string;
+		expect(filteredHints).not.toContain("reorder");
+
+		const subagentHints = invoke("renderHints", buildSelf(subagentRow("a-child", "a", "idle"), ""), 200) as string;
+		expect(subagentHints).not.toContain("reorder");
+
+		const scopedHints = invoke(
+			"renderHints",
+			{ ...buildSelf(agentRow({ identity: "a" }), ""), scopeKey: { sessionId: "scope-root" } },
+			200,
+		) as string;
+		expect(scopedHints).not.toContain("reorder");
+	});
+});
+
 function createUiServices(): InteractiveModeUiServices {
 	return {
 		settingsManager: SettingsManager.inMemory({ theme: "dark" }),
@@ -688,9 +1081,58 @@ describe("AgentsViewMode persistent catalog state", () => {
 		try {
 			await expect(invoke("refreshSessions", view, { preserveStatusOnError: true })).resolves.toBe(false);
 			expect(Reflect.get(view, "liveCatalogReady")).toBe(true);
+			// A failed payload is settled enough for scope fallback, but it never
+			// supplied the complete roster required for destructive pin pruning.
+			expect(Reflect.get(view, "liveCatalogComplete")).toBe(false);
 			expect(Reflect.get(view, "savedCatalogReady")).toBe(true);
 			expect(persistentState.scopeFrames).toEqual([{ scope, returnChat: root }]);
 			expect(persistentState.lastSuccessfulLiveSummaries).toEqual([root]);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("never marks the live catalog complete when the daemon returns a malformed session list", async () => {
+		// Distinct from the reject-path test above: client.request resolves
+		// successfully here, so the throw comes from response validation itself,
+		// which must run before liveCatalogComplete is set true, not after.
+		const persistentState = createInitialAgentsViewPersistentState({});
+		persistentState.lastSuccessfulSavedSessions = [];
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, persistentState);
+		Reflect.set(view, "client", {
+			isConnected: true,
+			request: vi.fn(async () => ({ success: true, data: { sessions: "not-an-array" } })),
+		});
+
+		try {
+			await expect(invoke("refreshSessions", view, { preserveStatusOnError: true })).resolves.toBe(false);
+			expect(Reflect.get(view, "liveCatalogReady")).toBe(true);
+			expect(Reflect.get(view, "liveCatalogComplete")).toBe(false);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("resets liveCatalogComplete if applySessionList itself throws after validation succeeds", async () => {
+		// Complements the malformed-payload test above: this proves the catch-path
+		// reset (R1), not just validation-before-flag-set. A valid payload passes
+		// expectSessionList, so liveCatalogComplete is set true, then
+		// applySessionList itself throws -- the catch must still reset the flag.
+		const persistentState = createInitialAgentsViewPersistentState({});
+		persistentState.lastSuccessfulSavedSessions = [];
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, persistentState);
+		Reflect.set(view, "client", {
+			isConnected: true,
+			request: vi.fn(async () => ({ success: true, data: { sessions: [] } })),
+		});
+		Reflect.set(view, "applySessionList", () => {
+			throw new Error("simulated post-validation failure");
+		});
+
+		try {
+			await expect(invoke("refreshSessions", view, { preserveStatusOnError: true })).resolves.toBe(false);
+			expect(Reflect.get(view, "liveCatalogReady")).toBe(true);
+			expect(Reflect.get(view, "liveCatalogComplete")).toBe(false);
 		} finally {
 			stopThemeWatcher();
 		}
