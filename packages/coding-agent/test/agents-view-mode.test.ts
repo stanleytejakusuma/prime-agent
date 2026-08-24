@@ -12,7 +12,11 @@ import {
 	createInitialAgentsViewPersistentState,
 	runAgentsViewMode,
 } from "../src/modes/agents-view/agents-view-mode.js";
-import { type AgentsViewRow, resolveAgentsViewLeftResult } from "../src/modes/agents-view/agents-view-state.js";
+import {
+	type AgentsViewRow,
+	getAgentsViewSummaryIdentity,
+	resolveAgentsViewLeftResult,
+} from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import { stopThemeWatcher } from "../src/modes/interactive/theme/theme.js";
@@ -860,5 +864,128 @@ describe("agents view startup notices", () => {
 		});
 
 		expect(runs).toBe(2);
+	});
+
+	it("promotes a confirmed saved-session delete to the stop flow when the session is actually live", async () => {
+		// A saved/inactive row (no activeSessionId) whose session file the daemon
+		// now reports as a live session -- e.g. an empty draft stuck on
+		// activity:"working". The confirmed delete must promote to the live
+		// stop-then-delete flow instead of refusing with
+		// "Session became active; stop it before deleting".
+		const saved = summary({
+			id: "draft-saved",
+			activeSessionId: undefined,
+			sessionId: "draft-session",
+			sessionFile: "/tmp/draft.jsonl",
+			messageCount: 0,
+		});
+		const live = summary({
+			id: "draft-active",
+			activeSessionId: "draft-active",
+			sessionId: "draft-session",
+			sessionFile: "/tmp/draft.jsonl",
+			activity: "working",
+			messageCount: 0,
+		});
+		const request = vi.fn(async (_command: { type: string }) => ({
+			success: true as const,
+			data: { sessions: [live] },
+		}));
+		const client = { request, supportsServerCapability: vi.fn(() => true) };
+		const calls: string[] = [];
+		const self = {
+			rows: [
+				{
+					kind: "agent",
+					section: "inactive",
+					summary: saved,
+					selectable: true,
+					identity: "draft-row",
+				},
+			],
+			selectedIndex: 0,
+			lastListedSummaries: [],
+			pendingDeleteAgent: undefined,
+			pendingKillSubagent: undefined,
+			deleteConfirmExpiresAt: 0,
+			deleteConfirmTimer: undefined,
+			selectedActiveSessionId: undefined,
+			inactiveAgentIdentities: new Set<string>(),
+			ui: { requestRender: vi.fn() },
+			requireClient: () => client,
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			refreshSavedSessions: vi.fn(async () => true),
+			getSavedSessionCatalogContext: () => ({ sessionDir: "/tmp", cwd: "/tmp" }),
+			isDeleteConfirmationVisible() {
+				return invoke("isDeleteConfirmationVisible", self);
+			},
+			showDeleteConfirmation() {
+				calls.push("showDeleteConfirmation");
+				return invoke("showDeleteConfirmation", self);
+			},
+			clearDeleteConfirmation(options: unknown) {
+				return invoke("clearDeleteConfirmation", self, options);
+			},
+			stopAgentForDeletion(row: unknown) {
+				calls.push("stopAgentForDeletion");
+				return invoke("stopAgentForDeletion", self, row);
+			},
+			deactivatePendingAgent() {
+				calls.push("deactivatePendingAgent");
+				return invoke("deactivatePendingAgent", self);
+			},
+		};
+
+		// Press 1: saved row -> confirmation.
+		await invoke("handleDeleteSelected", self);
+		expect(self.pendingDeleteAgent).toMatchObject({ sessionFile: "/tmp/draft.jsonl", stopped: false });
+		expect(calls).toContain("showDeleteConfirmation");
+
+		// Press 2 (confirm): daemon now reports the file as live -> promote.
+		await invoke("handleDeleteSelected", self);
+		expect(calls).toContain("stopAgentForDeletion");
+		expect(calls).not.toContain("deactivatePendingAgent");
+		// The pending delete now carries the live identity (file-based, same as the
+		// saved row), activeSessionId, and the stopped flag stopAgentForDeletion
+		// actually produced -- pinning what the promotion stored, not what a later
+		// hand-stitched press-3 state assumes.
+		expect(self.pendingDeleteAgent).toMatchObject({
+			sessionFile: "/tmp/draft.jsonl",
+			activeSessionId: "draft-active",
+		});
+		expect((self as Record<string, unknown>).pendingDeleteAgent).toMatchObject({
+			identity: getAgentsViewSummaryIdentity(live),
+			stopped: true,
+		});
+		// The stale refusal message must never appear.
+		expect(self.setStatusMessage).not.toHaveBeenCalledWith("Session became active; stop it before deleting", {
+			tone: "warning",
+		});
+
+		// Press 3 with the row now rebuilt from the live catalog (the daemon's own
+		// list is authoritative; reconcileCatalogs swaps the saved row for the live
+		// summary, which carries activeSessionId): the live-session path completes
+		// the delete instead of re-entering the saved-row branch.
+		self.rows = [
+			{
+				kind: "agent",
+				section: "running",
+				summary: live,
+				selectable: true,
+				identity: "draft-row",
+			},
+		];
+		(self as Record<string, unknown>).pendingDeleteAgent = {
+			identity: getAgentsViewSummaryIdentity(live),
+			activeSessionId: "draft-active",
+			sessionFile: live.sessionFile,
+			summary: live,
+			stopped: false,
+		};
+		self.deleteConfirmExpiresAt = Date.now() + 60_000;
+		await invoke("handleDeleteSelected", self);
+		expect(calls).toContain("deactivatePendingAgent");
+		expect(self.pendingDeleteAgent).toBeUndefined();
 	});
 });
