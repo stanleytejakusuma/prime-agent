@@ -41,6 +41,11 @@ interface SupervisorInternals {
 	log: ReturnType<typeof vi.fn>;
 	launchWorker: ReturnType<typeof vi.fn>;
 	reuseWorkerForCreate: ReturnType<typeof vi.fn>;
+	recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+	syncAgentPeers: ReturnType<typeof vi.fn>;
+	invalidateWorkerSessionInputPauses: ReturnType<typeof vi.fn>;
+	deleteWorkerDescriptor: ReturnType<typeof vi.fn>;
+	scheduleWorkerStopFinalization: ReturnType<typeof vi.fn>;
 	createOrReuseWorker(clientId: string, command: object): Promise<unknown>;
 	handleCommand(client: object, command: object): Promise<unknown>;
 }
@@ -390,5 +395,316 @@ describe("daemon supervisor saved-session delete vs worker summary residency", (
 			}),
 		).rejects.toThrow("Cannot delete the currently active session");
 		expect(supervisor.catalog.delete).not.toHaveBeenCalled();
+	});
+});
+
+describe("daemon supervisor stale-registration predicate: failed-lifecycle parity with reclaim (v0.8.0 rebase, Red gate 2)", () => {
+	it("isStaleWorkerRegistration treats a failed, unowned, process-gone worker as stale (upstream parity)", async () => {
+		const supervisor = makeSupervisor();
+		const worker = makeWorker("worker-failed-gone", []);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.ownerClientId = undefined;
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.processIdentity = vi.fn(() => "gone" as const);
+
+		const isStale = (
+			supervisor as unknown as { isStaleWorkerRegistration(worker: WorkerFixture): boolean }
+		).isStaleWorkerRegistration(worker);
+
+		expect(isStale).toBe(true);
+	});
+
+	it("isStaleWorkerRegistration treats a failed, unowned, process-replaced worker as stale", async () => {
+		const supervisor = makeSupervisor();
+		const worker = makeWorker("worker-failed-replaced", []);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.ownerClientId = undefined;
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.processIdentity = vi.fn(() => "replaced" as const);
+
+		const isStale = (
+			supervisor as unknown as { isStaleWorkerRegistration(worker: WorkerFixture): boolean }
+		).isStaleWorkerRegistration(worker);
+
+		expect(isStale).toBe(true);
+	});
+
+	it("isStaleWorkerRegistration refuses a failed, unowned worker whose process is still current (freshCreate-only case)", async () => {
+		const supervisor = makeSupervisor();
+		const worker = makeWorker("worker-failed-current", []);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.ownerClientId = undefined;
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.processIdentity = vi.fn(() => "current" as const);
+
+		const isStale = (
+			supervisor as unknown as { isStaleWorkerRegistration(worker: WorkerFixture): boolean }
+		).isStaleWorkerRegistration(worker);
+
+		expect(isStale).toBe(false);
+	});
+
+	it("isStaleWorkerRegistration refuses a failed worker that still has an owner, even with a dead process", async () => {
+		const supervisor = makeSupervisor();
+		const worker = makeWorker("worker-failed-owned", []);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.ownerClientId = "some-owner-client";
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.processIdentity = vi.fn(() => "gone" as const);
+
+		const isStale = (
+			supervisor as unknown as { isStaleWorkerRegistration(worker: WorkerFixture): boolean }
+		).isStaleWorkerRegistration(worker);
+
+		expect(isStale).toBe(false);
+	});
+
+	it("isStaleWorkerRegistration refuses a live-lifecycle worker with a dead process (not failed, no stop requested)", async () => {
+		const supervisor = makeSupervisor();
+		const worker = makeWorker("worker-ready-gone", []);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "ready";
+		worker.descriptor.ownerClientId = undefined;
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.processIdentity = vi.fn(() => "gone" as const);
+
+		const isStale = (
+			supervisor as unknown as { isStaleWorkerRegistration(worker: WorkerFixture): boolean }
+		).isStaleWorkerRegistration(worker);
+
+		expect(isStale).toBe(false);
+	});
+
+	it("deletes a saved session whose only registration is a failed, unowned, process-gone worker", async () => {
+		const supervisor = makeSupervisor();
+		const sessionFile = "/tmp/project/sessions/failed-ghost.jsonl";
+		const resident = makeSummary("failed-ghost-root", {
+			activeSessionId: "failed-ghost-root",
+			sessionId: "failed-ghost-1",
+			sessionFile,
+		});
+		const worker = makeWorker("worker-failed-ghost", [resident]);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.ownerClientId = undefined;
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.workers.set(worker.descriptor.workerId, worker);
+		supervisor.catalog.delete = vi.fn(async () => ({ status: "deleted" }));
+		supervisor.processIdentity = vi.fn(() => "gone" as const);
+
+		const response = (await supervisor.handleCommand(
+			{ id: "client-fg", attachedActiveSessionIds: new Set() } as unknown as object,
+			{ id: "cmd-fg", type: "delete_saved_session", sessionPath: sessionFile },
+		)) as { success: boolean; error?: string };
+
+		expect(response.success).toBe(true);
+		expect(supervisor.catalog.delete).toHaveBeenCalledWith(sessionFile);
+	});
+
+	it("refuses delete for a failed, unowned worker whose process is still current", async () => {
+		const supervisor = makeSupervisor();
+		const sessionFile = "/tmp/project/sessions/failed-current.jsonl";
+		const resident = makeSummary("failed-current-root", {
+			activeSessionId: "failed-current-root",
+			sessionId: "failed-current-1",
+			sessionFile,
+		});
+		const worker = makeWorker("worker-failed-current-2", [resident]);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.ownerClientId = undefined;
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.workers.set(worker.descriptor.workerId, worker);
+		supervisor.catalog.delete = vi.fn(async () => ({ status: "deleted" }));
+		supervisor.processIdentity = vi.fn(() => "current" as const);
+
+		await expect(
+			supervisor.handleCommand({ id: "client-fc", attachedActiveSessionIds: new Set() } as unknown as object, {
+				id: "cmd-fc",
+				type: "delete_saved_session",
+				sessionPath: sessionFile,
+			}),
+		).rejects.toThrow("Cannot delete the currently active session");
+		expect(supervisor.catalog.delete).not.toHaveBeenCalled();
+	});
+
+	it("refuses delete for a failed worker that still has an owner, even with a dead process", async () => {
+		const supervisor = makeSupervisor();
+		const sessionFile = "/tmp/project/sessions/failed-owned.jsonl";
+		const resident = makeSummary("failed-owned-root", {
+			activeSessionId: "failed-owned-root",
+			sessionId: "failed-owned-1",
+			sessionFile,
+		});
+		const worker = makeWorker("worker-failed-owned-2", [resident]);
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.ownerClientId = "some-owner-client";
+		worker.descriptor.stopRequestedAt = undefined;
+		supervisor.workers.set(worker.descriptor.workerId, worker);
+		supervisor.catalog.delete = vi.fn(async () => ({ status: "deleted" }));
+		supervisor.processIdentity = vi.fn(() => "gone" as const);
+
+		await expect(
+			supervisor.handleCommand({ id: "client-fo", attachedActiveSessionIds: new Set() } as unknown as object, {
+				id: "cmd-fo",
+				type: "delete_saved_session",
+				sessionPath: sessionFile,
+			}),
+		).rejects.toThrow("Cannot delete the currently active session");
+		expect(supervisor.catalog.delete).not.toHaveBeenCalled();
+	});
+
+	it("predicate-subset-of-reclaim parity: every state isStaleWorkerRegistration marks stale is a state reclaimStaleWorkerRegistration(freshCreate=false) actually removes", async () => {
+		// Red's Q2 concern: the fix is purely additive around reclaim's body, so a
+		// future upstream change to reclaim's conditions could rebase with zero
+		// conflicts and silently break the subset relation. This test enumerates
+		// the worker-state matrix and asserts predicate verdict against reclaim's
+		// OBSERVABLE behavior (worker removed from the registry) for each state,
+		// so drift becomes a red test at the next rebase instead of a silent gap.
+		const states: Array<{
+			name: string;
+			lifecycle: "starting" | "ready" | "recovering" | "failed";
+			ownerClientId: string | undefined;
+			stopRequestedAt: string | undefined;
+			identity: "current" | "replaced" | "gone" | "unknown";
+			hasClient: boolean;
+		}> = [
+			{
+				name: "failed/no-owner/gone",
+				lifecycle: "failed",
+				ownerClientId: undefined,
+				stopRequestedAt: undefined,
+				identity: "gone",
+				hasClient: false,
+			},
+			{
+				name: "failed/no-owner/replaced",
+				lifecycle: "failed",
+				ownerClientId: undefined,
+				stopRequestedAt: undefined,
+				identity: "replaced",
+				hasClient: false,
+			},
+			{
+				name: "failed/no-owner/current",
+				lifecycle: "failed",
+				ownerClientId: undefined,
+				stopRequestedAt: undefined,
+				identity: "current",
+				hasClient: false,
+			},
+			{
+				name: "failed/owned/gone",
+				lifecycle: "failed",
+				ownerClientId: "owner-x",
+				stopRequestedAt: undefined,
+				identity: "gone",
+				hasClient: false,
+			},
+			{
+				name: "ready/no-owner/gone (not failed, no stop requested)",
+				lifecycle: "ready",
+				ownerClientId: undefined,
+				stopRequestedAt: undefined,
+				identity: "gone",
+				hasClient: false,
+			},
+			{
+				name: "ready/stopRequested/gone",
+				lifecycle: "ready",
+				ownerClientId: undefined,
+				stopRequestedAt: "2026-08-01T00:00:00.000Z",
+				identity: "gone",
+				hasClient: false,
+			},
+			{
+				name: "ready/stopRequested/current",
+				lifecycle: "ready",
+				ownerClientId: undefined,
+				stopRequestedAt: "2026-08-01T00:00:00.000Z",
+				identity: "current",
+				hasClient: false,
+			},
+			{
+				name: "clientAttached/stopRequested/gone (client still connected)",
+				lifecycle: "ready",
+				ownerClientId: undefined,
+				stopRequestedAt: "2026-08-01T00:00:00.000Z",
+				identity: "gone",
+				hasClient: true,
+			},
+		];
+
+		for (const state of states) {
+			const supervisor = makeSupervisor();
+			supervisor.recoverUncertainWorkerOperations = vi.fn(async () => undefined) as unknown as never;
+			supervisor.syncAgentPeers = vi.fn(async () => undefined) as unknown as never;
+			supervisor.invalidateWorkerSessionInputPauses = vi.fn() as unknown as never;
+			supervisor.deleteWorkerDescriptor = vi.fn() as unknown as never;
+			supervisor.scheduleWorkerStopFinalization = vi.fn() as unknown as never;
+			const worker = makeWorker(`worker-${state.name}`, []);
+			worker.client = state.hasClient ? worker.client : undefined;
+			worker.descriptor.lifecycle = state.lifecycle;
+			worker.descriptor.ownerClientId = state.ownerClientId;
+			worker.descriptor.stopRequestedAt = state.stopRequestedAt;
+			supervisor.workers.set(worker.descriptor.workerId, worker);
+			supervisor.processIdentity = vi.fn(() => state.identity);
+
+			const predicateVerdict = (
+				supervisor as unknown as { isStaleWorkerRegistration(worker: WorkerFixture): boolean }
+			).isStaleWorkerRegistration(worker);
+
+			if (state.stopRequestedAt !== undefined) {
+				// The stopRequestedAt branch of reclaim schedules a background
+				// finalizer rather than removing the worker synchronously, and
+				// with the finalizer stubbed to a no-op the worker is still
+				// registered afterward -- reclaim then throws honestly ("still
+				// being cleaned up") instead of falsely reporting success. That
+				// throw itself IS the stale-branch behavior when the predicate
+				// says stale; when the predicate says not-stale, reclaim must
+				// return false without scheduling anything.
+				if (predicateVerdict) {
+					await expect(
+						(
+							supervisor as unknown as {
+								reclaimStaleWorkerRegistration(worker: WorkerFixture, freshCreate?: boolean): Promise<boolean>;
+							}
+						).reclaimStaleWorkerRegistration(worker, false),
+						`reclaim for ${state.name}`,
+					).rejects.toThrow("is still being cleaned up");
+					expect(
+						supervisor.scheduleWorkerStopFinalization,
+						`finalizer scheduled for ${state.name}`,
+					).toHaveBeenCalled();
+				} else {
+					const reclaimResult = await (
+						supervisor as unknown as {
+							reclaimStaleWorkerRegistration(worker: WorkerFixture, freshCreate?: boolean): Promise<boolean>;
+						}
+					).reclaimStaleWorkerRegistration(worker, false);
+					expect(reclaimResult, `reclaim result for ${state.name}`).toBe(false);
+					expect(
+						supervisor.scheduleWorkerStopFinalization,
+						`finalizer NOT scheduled for ${state.name}`,
+					).not.toHaveBeenCalled();
+				}
+				continue;
+			}
+
+			const reclaimResult = await (
+				supervisor as unknown as {
+					reclaimStaleWorkerRegistration(worker: WorkerFixture, freshCreate?: boolean): Promise<boolean>;
+				}
+			).reclaimStaleWorkerRegistration(worker, false);
+
+			expect(reclaimResult, `reclaim result for ${state.name}`).toBe(predicateVerdict);
+			const stillRegistered = supervisor.workers.has(worker.descriptor.workerId);
+			expect(!stillRegistered, `worker removed for ${state.name}`).toBe(predicateVerdict);
+		}
 	});
 });
