@@ -641,6 +641,8 @@ export class DaemonSupervisor {
 	private readonly workers = new Map<string, ResidentWorker>();
 	private workerStopCounts?: Map<ResidentWorker, number>;
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
+	/** Per-canonical-session-path mutex serializing delete against residency establishment. */
+	private readonly sessionPathLocks = new Map<string, Promise<void>>();
 	/** Public admission ids are scoped to the socket that registered them. */
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly sessionInputPauses = new Map<string, SupervisorSessionInputPause>();
@@ -2021,12 +2023,42 @@ export class DaemonSupervisor {
 			}
 			case "delete_saved_session":
 				if (!command.activeSessionId) {
-					const active = this.findWorkerBySessionFile(command.sessionPath);
-					if (active) {
-						throw new Error("Cannot delete the currently active session");
-					}
-					const result = await this.catalog.delete(command.sessionPath);
-					return success(command.id, command.type, result);
+					// Resolve name-form selectors the same way create does so the
+					// lock key and catalog.delete target are the canonical path a
+					// concurrent create would use (canonical-key equivalence).
+					const resolvedPath = looksLikeSessionPath(command.sessionPath)
+						? resolve(command.sessionPath)
+						: await this.catalog.resolve(
+								command.sessionPath,
+								this.defaultSessionConfig.cwd ?? process.cwd(),
+								this.defaultSessionConfig.sessionDir,
+							);
+					const canonical = canonicalSessionPath(resolvedPath);
+					return this.withSessionPathLock(canonical, async () => {
+						// Refuse only when ANY worker summary for this file is
+						// genuinely resident (has an activeSessionId). Summary maps
+						// can hold catalog-shadow entries for the same file (no
+						// activeSessionId) -- e.g. a stopping worker's stale list, a
+						// passive subagent whose root parent owns the file, or a
+						// session whose worker went quiet (#1078/#1201 ghost class) --
+						// while the merged agents-view list reports the catalog side
+						// (activeSessionId null, workerPid null). A lone shadow must
+						// not make the row undeletable. But the check is existential
+						// over ALL matching summaries: if any worker genuinely hosts
+						// the file, the delete is refused regardless of iteration
+						// order. Holding the session-path lock across this check AND
+						// catalog.delete makes the decision atomic against create/
+						// attach/resume: any create that was already in flight when
+						// we acquired the lock has published its resident summary
+						// (or failed) before we recheck, and any create arriving
+						// after us waits for the file removal to complete.
+						const resident = this.findResidentWorkerBySessionFile(resolvedPath);
+						if (resident) {
+							throw new Error("Cannot delete the currently active session");
+						}
+						const result = await this.catalog.delete(resolvedPath);
+						return success(command.id, command.type, result);
+					});
 				}
 				break;
 		}
@@ -2254,6 +2286,53 @@ export class DaemonSupervisor {
 			}
 			createCommand = { ...command, name: normalizedName };
 		}
+		if (command.sessionPath) {
+			// All residency establishment (create, attach, resume, wake) funnels
+			// through here. Serialize against delete_saved_session on the same
+			// canonical path. Double-checked locking: the fast-path
+			// openingWorkers check preserves create-create single-flighting
+			// (a truly concurrent second create returns the first's pending
+			// promise without touching the lock); the re-check inside the lock
+			// closes the delete race (a create that landed while we waited for
+			// the lock is reused instead of spawning a duplicate, and a delete
+			// that won the lock has completed before we re-enter).
+			const resolvedForLock = looksLikeSessionPath(command.sessionPath)
+				? resolve(command.sessionPath)
+				: await this.catalog.resolve(
+						command.sessionPath,
+						mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config).cwd ?? process.cwd(),
+						mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config).sessionDir,
+					);
+			const canonicalForLock = canonicalSessionPath(resolvedForLock);
+			const pendingFast = this.openingWorkers.get(canonicalForLock);
+			if (pendingFast) {
+				return pendingFast;
+			}
+			if (canonicalForLock) {
+				return this.withSessionPathLock(canonicalForLock, async () => {
+					const pendingSlow = this.openingWorkers.get(canonicalForLock);
+					if (pendingSlow) {
+						return pendingSlow;
+					}
+					return this.createOrReuseWorkerUnlocked(clientId, {
+						...createCommand,
+						sessionPath: resolvedForLock,
+					});
+				});
+			}
+		}
+		return this.createOrReuseWorkerUnlocked(clientId, createCommand);
+	}
+
+	private async createOrReuseWorkerUnlocked(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
+		let createCommand = command;
+		if (command.name !== undefined) {
+			const normalizedName = command.name.trim();
+			if (!normalizedName) {
+				throw new Error("Session name cannot be empty");
+			}
+			createCommand = { ...command, name: normalizedName };
+		}
 		const ownerClientId = command.lifecycle === "client_owned" ? clientId : undefined;
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
@@ -2310,6 +2389,49 @@ export class DaemonSupervisor {
 		}
 	}
 
+	// Shared identity sentinel so uncontended lock acquisition stays fully
+	// synchronous: `await` on this already-resolved promise still yields a
+	// microtask, and a created worker must register its openingWorkers entry
+	// in the same tick as the create call for concurrent same-path creates to
+	// single-flight (see createOrReuseWorker's fast path).
+	private static readonly UNCONTENDED = Promise.resolve();
+
+	private async withSessionPathLock<T>(canonicalPath: string, fn: () => Promise<T>): Promise<T> {
+		// Non-reentrant by contract: re-entering the SAME canonical path from
+		// inside fn() would self-deadlock (the inner acquisition queues on the
+		// outer gate). No current code path does this -- catalog.delete and
+		// launchWorker never re-enter create/delete for the same path -- so the
+		// contract is enforced by review rather than a runtime guard (a naive
+		// owner set cannot distinguish reentrancy from a legitimate concurrent
+		// waiter queueing behind the held lock).
+		const previous = this.sessionPathLocks.get(canonicalPath) ?? DaemonSupervisor.UNCONTENDED;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const tail = previous.then(() => gate);
+		this.sessionPathLocks.set(canonicalPath, tail);
+		if (previous === DaemonSupervisor.UNCONTENDED) {
+			try {
+				return await fn();
+			} finally {
+				release();
+				if (this.sessionPathLocks.get(canonicalPath) === tail) {
+					this.sessionPathLocks.delete(canonicalPath);
+				}
+			}
+		}
+		await previous;
+		try {
+			return await fn();
+		} finally {
+			release();
+			if (this.sessionPathLocks.get(canonicalPath) === tail) {
+				this.sessionPathLocks.delete(canonicalPath);
+			}
+		}
+	}
+
 	private reuseWorkerForCreate(
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
@@ -2324,6 +2446,35 @@ export class DaemonSupervisor {
 			return worker;
 		}
 		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
+	}
+
+	/**
+	 * Authoritative stale-registration predicate, shared by worker reclamation
+	 * and the saved-session delete residency check so the two can never drift
+	 * apart. A registration is stale only when: no client is connected, a stop
+	 * was requested (or the worker failed without an owner), and the recorded
+	 * process is confirmed dead or replaced. Everything else -- live, unknown
+	 * identity, still-stopping, failed-but-current, or a client attached -- is
+	 * NOT stale (delete must refuse for those).
+	 */
+	private isStaleWorkerRegistration(worker: ResidentWorker): boolean {
+		if (worker.client !== undefined || worker.recovery !== undefined) {
+			return false;
+		}
+		if (worker.descriptor.stopRequestedAt === undefined) {
+			// Upstream parity: a failed worker with no owner whose process is
+			// confirmed dead is reclaimable on the create path, so delete must
+			// treat it as non-resident too. A failed worker whose process is
+			// still current is NOT stale (it may be stopped on fresh create).
+			if (worker.descriptor.lifecycle !== "failed" || worker.descriptor.ownerClientId) {
+				return false;
+			}
+			const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+			return identity === "gone" || identity === "replaced";
+		}
+		// Single coherent observation; both callers must agree on one verdict.
+		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+		return identity === "gone" || identity === "replaced";
 	}
 
 	/**
@@ -3636,6 +3787,46 @@ export class DaemonSupervisor {
 				matchesSessionIdSuffix(activeSessionId, selector) || matchesSessionIdSuffix(summary.sessionId, selector)
 			);
 		});
+	}
+
+	/**
+	 * Whether ANY worker summary for the given session file is genuinely
+	 * resident (carries an activeSessionId). Iterates every worker and every
+	 * summary so the answer is order-independent: a catalog-shadow summary for
+	 * the same file (no activeSessionId) elsewhere in any map must not mask a
+	 * real resident owner.
+	 *
+	 * A worker registration whose process is confirmed dead (no client, a
+	 * stop requested or a failed lifecycle without an owner, and the recorded
+	 * process identity is gone/replaced -- the same criteria
+	 * createOrReuseWorker's reclaimStaleWorkerRegistration uses) is NOT a
+	 * resident owner: its summaries are a stale shadow left behind by an
+	 * incomplete stop, exactly the ghost-session class (#1078/#1201). Treating
+	 * it as resident would make the row permanently undeletable.
+	 */
+	private findResidentWorkerBySessionFile(sessionFile: string): WorkerMatch | undefined {
+		const target = canonicalSessionPath(sessionFile);
+		for (const worker of this.workers.values()) {
+			// Same authoritative predicate as reclamation: a confirmed-dead
+			// registration's summaries are a stale shadow, never a live owner.
+			// A stale registration must ALSO be terminal -- recovery/adoption
+			// only ever revives workers whose descriptors are still valid
+			// (reclaimStaleWorkerRegistration throws for stale ones), so once
+			// judged stale it cannot republish residency.
+			if (this.isStaleWorkerRegistration(worker)) {
+				continue;
+			}
+			for (const summary of worker.summaries.values()) {
+				if (
+					summary.activeSessionId !== undefined &&
+					summary.sessionFile &&
+					canonicalSessionPath(summary.sessionFile) === target
+				) {
+					return { worker, summary };
+				}
+			}
+		}
+		return undefined;
 	}
 
 	private findWorkerBySessionFile(sessionFile: string): ResidentWorker | undefined {
