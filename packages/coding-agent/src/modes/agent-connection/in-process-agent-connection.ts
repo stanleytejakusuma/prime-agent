@@ -34,6 +34,7 @@ import type {
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
+	AgentConnectionExtensionShortcut,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionForkOptions,
 	AgentConnectionHeadlessCompletionOptions,
@@ -322,6 +323,17 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined> {
 		return createAgentConnectionToolDefinition(this.session.getToolDefinition(name));
+	}
+
+	async getExtensionShortcuts(): Promise<AgentConnectionExtensionShortcut[]> {
+		// In-process connections always run with bindLocalSessionExtensions:
+		// true, so InteractiveMode reads shortcuts straight from the local
+		// ExtensionRunner and never calls this. Kept for interface conformance.
+		return [];
+	}
+
+	async runExtensionShortcut(_key: string, _extensionPath: string): Promise<void> {
+		// See getExtensionShortcuts: local mode never calls this path.
 	}
 
 	async setSessionEntryLabel(entryId: string, label: string | undefined): Promise<void> {

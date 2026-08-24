@@ -23,7 +23,11 @@ import {
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { discoverAndLoadExtensions } from "../src/core/extensions/loader.js";
+import { ExtensionRunner } from "../src/core/extensions/runner.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -8770,6 +8774,256 @@ describe("daemon mode helpers", () => {
 		expect(setRlmMaxDepth).toHaveBeenCalledWith(3, { global: true });
 	});
 
+	it("returns the raw extension shortcut registry for a session with a registered shortcut", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-extension-shortcuts-get-"));
+		try {
+			const { runner, extensionPath } = await makeExtensionShortcutFixture({
+				tempDir,
+				key: "ctrl+e",
+				description: "Cycle effort",
+			});
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active-1") as ActiveSessionState;
+			(state.runtime as { session: unknown }).session = { extensionRunner: runner };
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			const client = makeClient("client-1", state.activeSessionId);
+
+			const response = (await internals.handleCommand(client, {
+				type: "get_extension_shortcuts",
+				activeSessionId: state.activeSessionId,
+			})) as { success: true; data: { shortcuts: Array<{ shortcut: string; description?: string }> } };
+
+			expect(response.success).toBe(true);
+			expect(response.data.shortcuts).toEqual([{ shortcut: "ctrl+e", description: "Cycle effort", extensionPath }]);
+			// No handler field anywhere -- this must be JSON-serializable for the wire.
+			expect(JSON.stringify(response.data)).not.toContain("handler");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns an empty list from a session with no registered extension shortcuts", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-extension-shortcuts-empty-"));
+		try {
+			const sessionManager = SessionManager.inMemory();
+			const modelRegistry = ModelRegistry.create(AuthStorage.create(join(tempDir, "auth.json")));
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map() } as never,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active-1") as ActiveSessionState;
+			(state.runtime as { session: unknown }).session = { extensionRunner: runner };
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			const client = makeClient("client-1", state.activeSessionId);
+
+			await expect(
+				internals.handleCommand(client, {
+					type: "get_extension_shortcuts",
+					activeSessionId: state.activeSessionId,
+				}),
+			).resolves.toMatchObject({ success: true, data: { shortcuts: [] } });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("run_extension_shortcut invokes the real handler end to end, observable via a side effect", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-extension-shortcuts-run-"));
+		try {
+			delete (globalThis as { __daemonShortcutFixtureFired?: unknown }).__daemonShortcutFixtureFired;
+			const { runner, extensionPath } = await makeExtensionShortcutFixture({ tempDir, key: "ctrl+e" });
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active-1") as ActiveSessionState;
+			(state.runtime as { session: unknown }).session = { extensionRunner: runner };
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			const client = makeClient("client-1", state.activeSessionId);
+
+			const response = (await internals.handleCommand(client, {
+				type: "run_extension_shortcut",
+				activeSessionId: state.activeSessionId,
+				key: "ctrl+e",
+				extensionPath,
+			})) as { success: true; data: { found: boolean } };
+			expect(response.success).toBe(true);
+			expect(response.data.found).toBe(true);
+
+			// The handler is invoked fire-and-forget (not awaited by the daemon
+			// handler), so wait for the observable side effect to land.
+			await vi.waitFor(() => {
+				expect(
+					(globalThis as { __daemonShortcutFixtureFired?: { cwd: string } }).__daemonShortcutFixtureFired,
+				).toEqual({ cwd: tempDir });
+			});
+		} finally {
+			delete (globalThis as { __daemonShortcutFixtureFired?: unknown }).__daemonShortcutFixtureFired;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("run_extension_shortcut reports not-found for an unregistered key without throwing", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-extension-shortcuts-missing-"));
+		try {
+			const { runner } = await makeExtensionShortcutFixture({ tempDir, key: "ctrl+e" });
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active-1") as ActiveSessionState;
+			(state.runtime as { session: unknown }).session = { extensionRunner: runner };
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			const client = makeClient("client-1", state.activeSessionId);
+
+			await expect(
+				internals.handleCommand(client, {
+					type: "run_extension_shortcut",
+					activeSessionId: state.activeSessionId,
+					key: "ctrl+z",
+					extensionPath: "/tmp/absent-extension.ts",
+				}),
+			).resolves.toMatchObject({ success: true, data: { found: false } });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("run_extension_shortcut refuses a stale extension identity even when the key is still registered", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-extension-shortcuts-stale-"));
+		try {
+			delete (globalThis as { __daemonShortcutFixtureFired?: unknown }).__daemonShortcutFixtureFired;
+			const { runner, extensionPath } = await makeExtensionShortcutFixture({ tempDir, key: "ctrl+e" });
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active-1") as ActiveSessionState;
+			(state.runtime as { session: unknown }).session = { extensionRunner: runner };
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			const client = makeClient("client-1", state.activeSessionId);
+
+			await expect(
+				internals.handleCommand(client, {
+					type: "run_extension_shortcut",
+					activeSessionId: state.activeSessionId,
+					key: "ctrl+e",
+					extensionPath: `${extensionPath}.stale`,
+				}),
+			).resolves.toMatchObject({ success: true, data: { found: false } });
+			await Promise.resolve();
+			expect(
+				(globalThis as { __daemonShortcutFixtureFired?: unknown }).__daemonShortcutFixtureFired,
+			).toBeUndefined();
+		} finally {
+			delete (globalThis as { __daemonShortcutFixtureFired?: unknown }).__daemonShortcutFixtureFired;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		{
+			name: "reports a synchronous shortcut handler throw through extension errors without rejecting the command",
+			handler: "throw new Error('sync shortcut failure');",
+			expectedError: "sync shortcut failure",
+		},
+		{
+			name: "reports a rejected shortcut handler promise through extension errors without rejecting the command",
+			handler: "return Promise.reject(new Error('async shortcut failure'));",
+			expectedError: "async shortcut failure",
+		},
+	])("run_extension_shortcut $name", async ({ handler, expectedError }) => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-extension-shortcuts-error-"));
+		try {
+			const extensionsDir = join(tempDir, "extensions");
+			mkdirSync(extensionsDir);
+			const extensionPath = join(extensionsDir, "shortcut-error.ts");
+			writeFileSync(
+				extensionPath,
+				`export default function(pi) { pi.registerShortcut("ctrl+e", { handler: () => { ${handler} } }); }`,
+			);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir,
+				SessionManager.inMemory(),
+				ModelRegistry.create(AuthStorage.create(join(tempDir, "auth.json"))),
+			);
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError((error) => errors.push(error));
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active-1") as ActiveSessionState;
+			(state.runtime as { session: unknown }).session = { extensionRunner: runner };
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+
+			await expect(
+				internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+					type: "run_extension_shortcut",
+					activeSessionId: state.activeSessionId,
+					key: "ctrl+e",
+					extensionPath,
+				}),
+			).resolves.toMatchObject({ success: true, data: { found: true } });
+			await vi.waitFor(() => {
+				expect(errors).toContainEqual(
+					expect.objectContaining({ extensionPath, event: "shortcut", error: expectedError }),
+				);
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		{
 			name: "defers busy heartbeat cron jobs instead of queueing a follow-up",
@@ -10326,6 +10580,40 @@ function makeAgentFamilyState(
 		},
 	} as never;
 	return { state, acceptAgentMessagePrompt };
+}
+
+async function makeExtensionShortcutFixture(options: {
+	tempDir: string;
+	key: string;
+	description?: string;
+}): Promise<{ runner: ExtensionRunner; extensionPath: string }> {
+	const extensionsDir = join(options.tempDir, "extensions");
+	mkdirSync(extensionsDir, { recursive: true });
+	const extensionFile = join(extensionsDir, "shortcut-ext.ts");
+	writeFileSync(
+		extensionFile,
+		`
+			export default function(pi) {
+				pi.registerShortcut(${JSON.stringify(options.key)}, {
+					description: ${JSON.stringify(options.description ?? "Test shortcut")},
+					handler: async (ctx) => {
+						globalThis.__daemonShortcutFixtureFired = { cwd: ctx.cwd };
+					},
+				});
+			}
+		`,
+	);
+	const result = await discoverAndLoadExtensions([], options.tempDir, options.tempDir);
+	const sessionManager = SessionManager.inMemory();
+	const modelRegistry = ModelRegistry.create(AuthStorage.create(join(options.tempDir, "auth.json")));
+	const runner = new ExtensionRunner(
+		result.extensions,
+		result.runtime,
+		options.tempDir,
+		sessionManager,
+		modelRegistry,
+	);
+	return { runner, extensionPath: extensionFile };
 }
 
 function makeState(activeSessionId: string, parentActiveSessionId?: string): ActiveSessionState {

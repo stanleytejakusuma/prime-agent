@@ -51,6 +51,7 @@ import type {
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
+	AgentConnectionExtensionShortcut,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionForkOptions,
 	AgentConnectionHeadlessCompletionOptions,
@@ -852,6 +853,51 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.toolDefinition;
 	}
 
+	async getExtensionShortcuts(): Promise<AgentConnectionExtensionShortcut[]> {
+		if (!this.client.supportsServerCapability("extension_shortcuts")) {
+			return [];
+		}
+		try {
+			const data = await this.requestData<{
+				shortcuts: Array<{ shortcut: string; description?: string; extensionPath: string }>;
+			}>({
+				type: "get_extension_shortcuts",
+				activeSessionId: this.activeSessionId,
+			});
+			return data.shortcuts.map((entry) => ({
+				key: entry.shortcut,
+				description: entry.description,
+				extensionPath: entry.extensionPath,
+			}));
+		} catch (error) {
+			if (isUnknownDaemonCommandError(error, "get_extension_shortcuts")) {
+				return [];
+			}
+			throw error;
+		}
+	}
+
+	async runExtensionShortcut(key: string, extensionPath: string): Promise<void> {
+		if (!this.client.supportsServerCapability("extension_shortcuts")) {
+			return;
+		}
+		try {
+			await this.requestOk({
+				type: "run_extension_shortcut",
+				activeSessionId: this.activeSessionId,
+				key,
+				extensionPath,
+			});
+		} catch (error) {
+			// Capability data comes from a transient hello. A daemon replaced by
+			// an older version can reject this after the client matched locally;
+			// graceful degradation means that key stays unconsumed on the next
+			// refresh, not that input handling throws.
+			if (isUnknownDaemonCommandError(error, "run_extension_shortcut")) return;
+			throw error;
+		}
+	}
+
 	async setSessionEntryLabel(entryId: string, label: string | undefined): Promise<void> {
 		await this.requestOk({
 			type: "set_session_entry_label",
@@ -1637,6 +1683,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.emit({ type: "session_status", recap: message.recap });
 			return;
 		}
+		if (message.type === "extension_shortcuts_changed") {
+			await this.emit({ type: "extension_shortcuts_changed" });
+			return;
+		}
 		if (message.type === "session_resynced") {
 			this.attachedSessionId = message.snapshot.state.sessionId;
 			this.attachedSessionFile = message.snapshot.state.sessionFile;
@@ -2249,6 +2299,8 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "get_last_assistant_text":
 		case "get_system_prompt":
 		case "get_tool_definition":
+		case "get_extension_shortcuts":
+		case "run_extension_shortcut":
 		case "start_side_question":
 		case "abort_side_question":
 		case "export_html":

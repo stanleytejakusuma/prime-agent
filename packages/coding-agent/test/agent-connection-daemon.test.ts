@@ -53,6 +53,11 @@ class FakeDaemonClient {
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
 	inputPauseAcquireGate: Promise<void> | undefined;
+	extensionShortcutsUnknownCommand = false;
+	runExtensionShortcutUnknownCommand = false;
+	extensionShortcutsData: Array<{ shortcut: string; description?: string; extensionPath: string }> = [
+		{ shortcut: "ctrl+e", description: "Cycle effort", extensionPath: "/tmp/ext.ts" },
+	];
 	cronAddGate: Promise<void> | undefined;
 	promptGate: Promise<void> | undefined;
 	promptError: Error | undefined;
@@ -211,6 +216,36 @@ class FakeDaemonClient {
 					command: command.type,
 					success: true,
 					data: { models: [getModel("openai", "gpt-5.1")] },
+				};
+			case "get_extension_shortcuts":
+				if (this.extensionShortcutsUnknownCommand) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Unknown daemon command: get_extension_shortcuts",
+					};
+				}
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { shortcuts: this.extensionShortcutsData },
+				};
+			case "run_extension_shortcut":
+				if (this.runExtensionShortcutUnknownCommand) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Unknown daemon command: run_extension_shortcut",
+					};
+				}
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { found: true },
 				};
 			case "get_session_context":
 				return {
@@ -2632,6 +2667,96 @@ describe("DaemonAgentConnection", () => {
 			type: "get_available_models",
 			activeSessionId: "active-1",
 		});
+	});
+
+	it("loads extension shortcuts through the daemon protocol when the capability is present", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("extension_shortcuts");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		const shortcuts = await connection.getExtensionShortcuts();
+
+		expect(shortcuts).toEqual([{ key: "ctrl+e", description: "Cycle effort", extensionPath: "/tmp/ext.ts" }]);
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_extension_shortcuts",
+			activeSessionId: "active-1",
+		});
+	});
+
+	it("degrades cleanly to an empty list against an old daemon lacking the extension_shortcuts capability, without sending the command", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const requestCountBefore = fakeClient.requests.length;
+
+		await expect(connection.getExtensionShortcuts()).resolves.toEqual([]);
+		// The capability check short-circuits before any request is sent -- the
+		// old daemon never even sees get_extension_shortcuts.
+		expect(fakeClient.requests.length).toBe(requestCountBefore);
+	});
+
+	it("degrades cleanly to an empty list when the daemon reports the command as unknown despite advertising the capability", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("extension_shortcuts");
+		fakeClient.extensionShortcutsUnknownCommand = true;
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getExtensionShortcuts()).resolves.toEqual([]);
+	});
+
+	it("fires run_extension_shortcut without sending it to an old daemon lacking the capability", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const requestCountBefore = fakeClient.requests.length;
+
+		await expect(connection.runExtensionShortcut("ctrl+e", "/tmp/ext.ts")).resolves.toBeUndefined();
+		expect(fakeClient.requests.length).toBe(requestCountBefore);
+	});
+
+	it("sends run_extension_shortcut with the matched key to a capable daemon", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("extension_shortcuts");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await connection.runExtensionShortcut("ctrl+e", "/tmp/ext.ts");
+
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "run_extension_shortcut",
+			activeSessionId: "active-1",
+			key: "ctrl+e",
+			extensionPath: "/tmp/ext.ts",
+		});
+	});
+
+	it("treats an unknown run_extension_shortcut command as a safe no-op after a stale capability hello", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("extension_shortcuts");
+		fakeClient.runExtensionShortcutUnknownCommand = true;
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.runExtensionShortcut("ctrl+e", "/tmp/ext.ts")).resolves.toBeUndefined();
+	});
+
+	it("forwards extension_shortcuts_changed as a session-agnostic invalidation event", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "extension_shortcuts_changed") {
+				events.push(event);
+			}
+		});
+		await connection.attach();
+
+		fakeClient.emitMessage({ type: "extension_shortcuts_changed", activeSessionId: "active-1" });
+		await Promise.resolve();
+
+		expect(events).toHaveLength(1);
 	});
 
 	it("loads session context through the daemon protocol", async () => {

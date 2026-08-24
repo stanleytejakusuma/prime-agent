@@ -81,16 +81,17 @@ import {
 	DEFAULT_HEARTBEAT_DELIVERY_MODE,
 	parseHeartbeatCommand,
 } from "../../core/cron-jobs.js";
-import type {
-	AutocompleteProviderFactory,
-	ContextUsage,
-	EditorFactory,
-	ExtensionCommandContext,
-	ExtensionContext,
+import {
+	type AutocompleteProviderFactory,
+	type ContextUsage,
+	type EditorFactory,
+	type ExtensionCommandContext,
+	type ExtensionContext,
 	ExtensionRunner,
-	ExtensionUIContext,
-	ExtensionUIDialogOptions,
-	ExtensionWidgetOptions,
+	type ExtensionShortcutDescriptor,
+	type ExtensionUIContext,
+	type ExtensionUIDialogOptions,
+	type ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
@@ -928,6 +929,17 @@ export class InteractiveMode {
 	private agentConnection: AgentConnection;
 	private localSessionHost: InteractiveModeLocalSessionHost | undefined;
 	private bindLocalSessionExtensions: boolean;
+	/**
+	 * Daemon-sourced extension shortcut registry (Option B of the
+	 * daemon-shortcuts fix). Only populated for daemon-attached clients
+	 * (bindLocalSessionExtensions === false); local clients read shortcuts
+	 * straight from the local ExtensionRunner instead. Handler-free by design:
+	 * a match here only decides whether to fire run_extension_shortcut, the
+	 * real handler always executes daemon-side.
+	 */
+	private daemonExtensionShortcuts: Map<KeyId, ExtensionShortcutDescriptor> = new Map();
+	/** Increments whenever daemon shortcut state is invalidated; stale fetches may not repopulate it. */
+	private daemonExtensionShortcutGeneration = 0;
 	private ui: TUI;
 	private chatContainer: Container;
 	private shortcutGuideContainer: Container;
@@ -2876,13 +2888,25 @@ export class InteractiveMode {
 		this.applyRuntimeSettings();
 		if (this.bindLocalSessionExtensions) {
 			await this.bindCurrentSessionExtensions();
+			this.subscribeToAgent();
 		} else {
 			setRegisteredThemes(this.uiServices.getThemes());
 			await this.refreshConnectionCatalog();
 			this.setupAutocompleteProvider();
+			this.setupDaemonExtensionShortcuts();
+			this.clearDaemonExtensionShortcuts();
+			// Subscribe before the initial fetch. A bind/reload can emit an
+			// invalidation between these two operations; its generation then
+			// prevents the older response from restoring stale keys.
+			this.subscribeToAgent();
+			try {
+				await this.refreshDaemonExtensionShortcuts();
+			} catch {
+				// The map is already cleared by refresh's fail-closed path. Startup
+				// remains usable with extension shortcuts disabled.
+			}
 			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
-		this.subscribeToAgent();
 		await Promise.all([this.refreshConnectionQueue(), this.refreshHeartbeatCatalog().catch(() => undefined)]);
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
@@ -3198,6 +3222,62 @@ export class InteractiveMode {
 			}
 			return false;
 		};
+	}
+
+	/**
+	 * Daemon-client counterpart of setupExtensionShortcuts(). Registers a
+	 * synchronous handler: it matches a locally resolved descriptor and then
+	 * fire-and-forgets daemon execution. The handler must return before the
+	 * transport round trip, because CustomEditor consumes input synchronously.
+	 */
+	private setupDaemonExtensionShortcuts(): void {
+		this.defaultEditor.onExtensionShortcut = (data: string) => {
+			for (const [key, shortcut] of this.daemonExtensionShortcuts) {
+				if (matchesKey(data, key)) {
+					this.agentConnection.runExtensionShortcut(key, shortcut.extensionPath).catch((err) => {
+						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
+					});
+					return true;
+				}
+			}
+			return false;
+		};
+	}
+
+	/**
+	 * Clear before every lifecycle boundary or failed refresh. Incrementing the
+	 * generation makes all requests started before this point stale, so an old
+	 * response can never repopulate the map after an invalidation/reconnect.
+	 */
+	private clearDaemonExtensionShortcuts(): void {
+		this.daemonExtensionShortcutGeneration++;
+		this.daemonExtensionShortcuts.clear();
+	}
+
+	/**
+	 * Re-fetch raw descriptors and apply the same built-in conflict policy as
+	 * ExtensionRunner.getShortcuts(), locally against this client's effective
+	 * keybindings. A failed request fails closed by clearing the active map.
+	 */
+	private async refreshDaemonExtensionShortcuts(): Promise<void> {
+		const generation = ++this.daemonExtensionShortcutGeneration;
+		try {
+			const shortcuts = await this.agentConnection.getExtensionShortcuts();
+			if (generation !== this.daemonExtensionShortcutGeneration) return;
+			this.daemonExtensionShortcuts = ExtensionRunner.resolveShortcutDescriptors(
+				shortcuts.map((shortcut) => ({
+					shortcut: shortcut.key.toLowerCase() as KeyId,
+					description: shortcut.description,
+					extensionPath: shortcut.extensionPath,
+				})),
+				this.keybindings.getEffectiveConfig(),
+			);
+		} catch (error) {
+			if (generation === this.daemonExtensionShortcutGeneration) {
+				this.clearDaemonExtensionShortcuts();
+			}
+			throw error;
+		}
 	}
 
 	private setExtensionStatus(key: string, text: string | undefined): void {
@@ -5215,12 +5295,19 @@ export class InteractiveMode {
 						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
 						event.status === "reconnecting" ? "warning" : "dim",
 					);
-					if (event.status === "connected") {
+					if (event.status === "reconnecting") {
+						this.clearDaemonExtensionShortcuts();
+					} else {
 						await this.refreshHeartbeatCatalog();
+						await this.refreshDaemonExtensionShortcuts();
 					}
 				} else if (event.type === "heartbeats_changed") {
 					await this.refreshHeartbeatCatalog();
+				} else if (event.type === "extension_shortcuts_changed") {
+					this.clearDaemonExtensionShortcuts();
+					await this.refreshDaemonExtensionShortcuts();
 				} else if (event.type === "closed") {
+					this.clearDaemonExtensionShortcuts();
 					this.showError(event.error ?? "Agent connection closed");
 				}
 			} catch (error) {
@@ -9002,6 +9089,10 @@ export class InteractiveMode {
 			if (this.bindLocalSessionExtensions) {
 				const runner = this.getLocalSessionHost().getExtensionRunner();
 				this.setupExtensionShortcuts(runner);
+			} else {
+				this.setupDaemonExtensionShortcuts();
+				this.clearDaemonExtensionShortcuts();
+				await this.refreshDaemonExtensionShortcuts();
 			}
 			await this.rebuildChatFromMessages();
 			dismissReloadBox(this.editor as Component);
@@ -9971,10 +10062,11 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 | mouse click on link | Open link in browser |
 `;
 
-		const shortcuts = this.bindLocalSessionExtensions
+		const shortcuts: ReadonlyMap<KeyId, { description?: string; extensionPath: string }> = this
+			.bindLocalSessionExtensions
 			? this.getLocalSessionHost().getExtensionRunner().getShortcuts(this.keybindings.getEffectiveConfig())
-			: undefined;
-		if (shortcuts && shortcuts.size > 0) {
+			: this.daemonExtensionShortcuts;
+		if (shortcuts.size > 0) {
 			hotkeys += `
 **Extensions**
 | Key | Action |
