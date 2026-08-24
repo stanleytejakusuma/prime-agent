@@ -1,6 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
 
@@ -227,6 +236,76 @@ function reclaimStaleLease(directory: string): boolean {
 	}
 	rmSync(stalePath, { recursive: true, force: true });
 	return true;
+}
+
+/**
+ * Remove every session-lease directory under agentDir whose owner process is
+ * no longer alive (fork fix: ghost-sweep). A crashed or killed daemon worker
+ * leaves its lease directory behind forever otherwise, and the daemon then
+ * resolves the corresponding session as permanently active -- it appears in
+ * the agents view as an undeletable "(no messages)" ghost row, because Ctrl+X
+ * reports "Session became active; stop it before deleting".
+ *
+ * Safe by construction: a live process can always re-acquire a lease that
+ * gets swept out from under it (the acquisition path creates the directory
+ * fresh), so removing a lease whose recorded owner is provably dead never
+ * disrupts a real, running session.
+ *
+ * This ports only the verified-safe half of the logic bisected from an
+ * earlier upstream PR (#1079): the companion change there that also
+ * excluded a "session_state" entry type from persistence broke passive RLM
+ * child discovery and is deliberately NOT replicated here.
+ */
+
+/**
+ * True when sessionPath has a lease directory whose recorded owner is
+ * currently alive (fork fix: ghost-sweep). Used to distinguish a genuine
+ * empty ghost draft from a legitimate passive RLM child session, which
+ * shares the exact same on-disk shape (bootstrap entries plus a
+ * session_state entry, no messages) but has a live owning process.
+ */
+export function hasLiveSessionLease(agentDir: string, sessionPath: string): boolean {
+	const canonicalPath = canonicalSessionPath(sessionPath);
+	const directory = leaseDirectory(agentDir, canonicalPath);
+	const owner = readLeaseOwner(directory);
+	return owner !== undefined && isLeaseOwnerAlive(owner);
+}
+
+export function sweepStaleSessionLeases(agentDir: string): number {
+	const root = join(agentDir, "session-leases");
+	if (!existsSync(root)) {
+		return 0;
+	}
+	let swept = 0;
+	let entries: string[];
+	try {
+		entries = readdirSync(root);
+	} catch {
+		return 0;
+	}
+	for (const entry of entries) {
+		if (!entry.endsWith(".lock")) {
+			continue;
+		}
+		const directory = join(root, entry);
+		const owner = readLeaseOwner(directory);
+		if (!owner) {
+			// Malformed or incomplete lease directory: reclaim it. A lease
+			// mid-creation by a live process is guarded by withLeaseGuard
+			// elsewhere, so an unreadable owner.json here means the writer died
+			// before finishing, not a live in-progress write.
+			if (reclaimStaleLease(directory)) {
+				swept++;
+			}
+			continue;
+		}
+		if (!isLeaseOwnerAlive(owner)) {
+			if (reclaimStaleLease(directory)) {
+				swept++;
+			}
+		}
+	}
+	return swept;
 }
 
 export function acquireSessionLease(
