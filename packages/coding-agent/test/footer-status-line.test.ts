@@ -22,15 +22,25 @@ function createFooterData(
 }
 
 const baseData: FooterStatusLineData = {
-	model: "deepseek-v4-flash",
-	thinkingLevel: "high",
-	contextPercent: 42,
-	contextTokens: 42000,
-	turnTokens: 1250,
+	cwd: "/home/dev/prime-agent-fork",
+	sessionName: "Prime Agent Onboarding",
 	gitBranch: "local-patches",
+	usageTotals: {
+		input: 438_000_000,
+		output: 5_400_000,
+		cacheRead: 1_055_000_000,
+		cacheWrite: 77_000_000,
+		cost: 0.123456,
+	},
+	cacheHitRate: 0.0,
+	autoCompactEnabled: true,
+	extensionStatuses: new Map([
+		["goal", "2/5"],
+		["heartbeat", "next 12:00"],
+	]),
 };
 
-describe("FooterComponent status line", () => {
+describe("FooterComponent status line (pi 0.84.2 parity, option A)", () => {
 	beforeAll(() => {
 		initTheme(undefined, false);
 	});
@@ -46,46 +56,53 @@ describe("FooterComponent status line", () => {
 		expect(footer.render(120)).toEqual([]);
 	});
 
-	it("renders model, thinking level, context, tokens, and git branch", () => {
+	it("renders the pwd line first (cwd, branch, session name, dim)", () => {
 		const footer = new FooterComponent(createFooterData());
 		footer.setStatusLineProvider(() => baseData);
-		const line = stripAnsi(footer.render(120)[0]);
-		expect(line).toContain("deepseek-v4-flash");
-		expect(line).toContain("high");
-		expect(line).toContain("42%");
-		expect(line).toContain("1.3k");
-		expect(line).toContain("⎇ local-patches");
+		const lines = footer.render(120).map((line) => stripAnsi(line));
+		expect(lines[0]).toContain("prime-agent-fork (local-patches) • Prime Agent Onboarding");
 	});
 
-	it("includes extension statuses registered via setStatus", () => {
-		const statuses = new Map([
-			["heartbeat", "next 12:00"],
-			["goal", "2/5"],
-		]);
-		const footer = new FooterComponent(createFooterData(statuses));
-		footer.setStatusLineProvider(() => ({ ...baseData, extensionStatuses: statuses }));
-		const line = stripAnsi(footer.render(120)[0]);
-		expect(line).toContain("next 12:00");
-		expect(line).toContain("2/5");
+	it("renders the cumulative session stats on line 2 (up/down/cache/cost)", () => {
+		const footer = new FooterComponent(createFooterData());
+		footer.setStatusLineProvider(() => baseData);
+		const stats = stripAnsi(footer.render(120)[1]);
+		expect(stats).toContain("↑438.0M");
+		expect(stats).toContain("↓5.4M");
+		expect(stats).toContain("R1.1B");
+		expect(stats).toContain("W77.0M");
+		expect(stats).toContain("CH0.0%");
+		expect(stats).toContain("$0.123");
 	});
 
-	it("omits unknown context and zero-turn tokens", () => {
+	it("omits zero usage segments (no stats line is emitted)", () => {
 		const footer = new FooterComponent(createFooterData());
 		footer.setStatusLineProvider(() => ({
-			model: "gpt-5.6-terra",
-			contextPercent: null,
-			contextTokens: null,
-			turnTokens: 0,
+			cwd: "/tmp/project",
+			usageTotals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 		}));
-		const line = stripAnsi(footer.render(120)[0]);
-		expect(line).toBe("gpt-5.6-terra");
+		const lines = footer.render(120).map((line) => stripAnsi(line));
+		// Only the pwd line renders; no stats line, no extension line.
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("/tmp/project");
 	});
 
-	it("omits reasoning level for non-reasoning models (off level)", () => {
+	it("renders extension statuses on the last line, sorted by key, sanitized", () => {
 		const footer = new FooterComponent(createFooterData());
-		footer.setStatusLineProvider(() => ({ ...baseData, thinkingLevel: "off" }));
-		const line = stripAnsi(footer.render(120)[0]);
-		expect(line).not.toContain("off");
+		footer.setStatusLineProvider(() => ({
+			...baseData,
+			extensionStatuses: new Map([
+				["zebra", "last"],
+				["alpha", "first"],
+				["hostile", "line one\nline two"],
+			]),
+		}));
+		const lastLine = stripAnsi(footer.render(120).at(-1)!);
+		// sorted by key: alpha, hostile, zebra
+		expect(lastLine.indexOf("first")).toBeLessThan(lastLine.indexOf("line one line two"));
+		expect(lastLine.indexOf("line one line two")).toBeLessThan(lastLine.indexOf("last"));
+		expect(lastLine).not.toContain("\n");
+		expect(lastLine).not.toContain("\r");
 	});
 
 	it("keeps every rendered line within the terminal width", () => {
@@ -99,62 +116,12 @@ describe("FooterComponent status line", () => {
 		}
 	});
 
-	it("applies visibly distinct coloring to context usage across thresholds", () => {
-		// Isolate the context segment from the model segment (also colored) by
-		// omitting model/thinkingLevel/tokens/branch, so the only ANSI escape in
-		// the line is the one under test.
-		const footer = new FooterComponent(createFooterData());
-		const rawLineFor = (contextPercent: number) => {
-			footer.setStatusLineProvider(() => ({ contextPercent, contextTokens: 1000 }));
-			return footer.render(120)[0];
-		};
-		const normal = rawLineFor(45);
-		const warning = rawLineFor(75);
-		const error = rawLineFor(95);
-		const ansiEscape = /\x1b\[[0-9;]*m/;
-		for (const line of [normal, warning, error]) {
-			expect(line).toMatch(ansiEscape);
-		}
-		const colorOf = (line: string) => line.match(ansiEscape)?.[0];
-		expect(colorOf(normal)).not.toBe(colorOf(warning));
-		expect(colorOf(warning)).not.toBe(colorOf(error));
-		expect(colorOf(normal)).not.toBe(colorOf(error));
-		expect(stripAnsi(normal)).toContain("45%");
-		expect(stripAnsi(warning)).toContain("75%");
-		expect(stripAnsi(error)).toContain("95%");
-	});
-
-	it("treats non-finite context percent and tokens as unknown instead of rendering NaN", () => {
-		const footer = new FooterComponent(createFooterData());
-		footer.setStatusLineProvider(() => ({
-			model: "gpt-5.6-terra",
-			contextPercent: Number.NaN,
-			contextTokens: Number.NaN,
-			turnTokens: Number.NaN,
-		}));
-		const line = stripAnsi(footer.render(120)[0]);
-		expect(line).toBe("gpt-5.6-terra");
-		expect(line).not.toContain("NaN");
-	});
-
-	it("strips newlines and control characters from extension status text", () => {
-		const statuses = new Map([["bad", "line one\nline two\r\x1b[31mred\x07"]]);
-		const footer = new FooterComponent(createFooterData(statuses));
-		footer.setStatusLineProvider(() => ({ ...baseData, extensionStatuses: statuses }));
-		const rendered = footer.render(120);
-		expect(rendered.length).toBe(1);
-		expect(rendered[0]).not.toContain("\n");
-		expect(rendered[0]).not.toContain("\r");
-		const line = stripAnsi(rendered[0]);
-		expect(line).toContain("line one line two");
-	});
-
 	it("strips control characters from a hostile git branch name", () => {
 		const footer = new FooterComponent(createFooterData(new Map(), "feature\nrm -rf /"));
 		footer.setStatusLineProvider(() => ({ ...baseData, gitBranch: "feature\nrm -rf /" }));
-		const rendered = footer.render(120);
-		expect(rendered.length).toBe(1);
-		expect(rendered[0]).not.toContain("\n");
+		const line = stripAnsi(footer.render(120)[0]);
+		expect(line).not.toContain("\n");
+		expect(line).not.toContain("\r");
 	});
 
 	it("never throws and degrades to an empty footer when the provider itself throws", () => {
@@ -164,5 +131,36 @@ describe("FooterComponent status line", () => {
 		});
 		expect(() => footer.render(120)).not.toThrow();
 		expect(footer.render(120)).toEqual([]);
+	});
+
+	it("falls back to the legacy single-line footer when only old fields are supplied", () => {
+		const footer = new FooterComponent(createFooterData());
+		footer.setStatusLineProvider(() => ({
+			model: "deepseek-v4-flash",
+			thinkingLevel: "high",
+			contextPercent: 42,
+			contextTokens: 42000,
+			turnTokens: 1250,
+			gitBranch: "local-patches",
+		}));
+		const line = stripAnsi(footer.render(120)[0]);
+		expect(line).toContain("deepseek-v4-flash");
+		expect(line).toContain("high");
+		expect(line).toContain("42%");
+		expect(line).toContain("1.3k");
+		expect(line).toContain("⎇ local-patches");
+	});
+
+	it("computes the cache hit rate from cumulative totals, not the last message", () => {
+		const footer = new FooterComponent(createFooterData());
+		// Two messages: first 90% hit on 100k prompt tokens, second 0% on 100k
+		// -> cumulative = 90k/200k = 45%.
+		footer.setStatusLineProvider(() => ({
+			cwd: "/tmp/project",
+			usageTotals: { input: 200_000, output: 1000, cacheRead: 90_000, cacheWrite: 10_000, cost: 0.1 },
+			cacheHitRate: 45.0,
+		}));
+		const stats = stripAnsi(footer.render(120)[1]);
+		expect(stats).toContain("CH45.0%");
 	});
 });

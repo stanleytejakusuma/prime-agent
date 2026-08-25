@@ -3,7 +3,7 @@ import { Container, type MarkdownTheme, type TUI } from "@earendil-works/pi-tui"
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/index.js";
-import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
+import { AgentActivityTracker, SessionUsageTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import type { FileChangeSummary } from "../src/modes/interactive/components/edit-summary.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
@@ -80,6 +80,7 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		toolOutputExpanded: false,
 		footer: { invalidate: vi.fn() },
 		activityTracker: new AgentActivityTracker(),
+		sessionUsageTracker: new SessionUsageTracker(),
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		chatContainer: new Container(),
 		recapContainer: new Container(),

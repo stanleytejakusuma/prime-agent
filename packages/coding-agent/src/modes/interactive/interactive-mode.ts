@@ -174,7 +174,12 @@ import {
 	formatPackageUpdateNotice,
 	formatUpdateAvailableNotice,
 } from "../shared/startup-notices.js";
-import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
+import {
+	AGENT_ACTIVITY_LABELS,
+	AgentActivityTracker,
+	formatTokenCount,
+	SessionUsageTracker,
+} from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
 import { AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
@@ -1001,6 +1006,7 @@ export class InteractiveMode {
 	private pulseTimer: NodeJS.Timeout | undefined = undefined;
 	private pulseFrame = 0;
 	private readonly activityTracker = new AgentActivityTracker();
+	private readonly sessionUsageTracker = new SessionUsageTracker();
 	// activityTracker token count already folded into the context snapshot; only output beyond
 	// this counts as live in-flight (keeps auto-retries from re-adding a failed attempt).
 	private contextUsageTokenBaseline = 0;
@@ -3009,6 +3015,7 @@ export class InteractiveMode {
 	}
 
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
+		this.sessionUsageTracker.seed(snapshot.messages ?? []);
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
 		this.restoreTurnStartFromMessages(this.getSessionContextFromConnectionSnapshot(snapshot).messages);
@@ -5515,6 +5522,7 @@ export class InteractiveMode {
 			this.renderRecap();
 		}
 		this.activityTracker.handleEvent(event);
+		this.sessionUsageTracker.handleEvent(event);
 		this.updateWorkingLoaderMessage();
 
 		switch (event.type) {
@@ -6245,19 +6253,19 @@ export class InteractiveMode {
 	}
 
 	private buildFooterStatusLine(): FooterStatusLineData | undefined {
-		const model = this.getCurrentModel();
-		if (!model) {
-			return undefined;
-		}
-		// Model, reasoning level, and context usage already live in the tray
-		// (getTrayLocationLabel / getTrayContextLabel, rendered just above the
-		// editor) -- this footer must not restate them or the same numbers show
-		// up twice on screen. It only carries data the tray does not already
-		// surface: current-turn tokens, git branch, and extension statuses.
-		const status = this.activityTracker.getStatus();
+		// Pi 0.84.2 parity (option A). The tray owns model/thinking/context
+		// (getTrayLocationLabel / getTrayContextLabel), so the footer carries
+		// only what the tray does not surface: the pwd/branch/session line and
+		// the cumulative session token/cache/cost stats. Cumulative totals are
+		// computed from the full message list the client holds (attach snapshot
+		// plus live events), the same data source pi's own footer iterates.
 		return {
-			turnTokens: status.tokens,
+			cwd: this.getCurrentCwd(),
+			sessionName: this.getCurrentSessionName(),
 			gitBranch: this.footerDataProvider.getGitBranch(),
+			usageTotals: this.sessionUsageTracker.hasAnyData ? this.sessionUsageTracker.getTotals() : undefined,
+			cacheHitRate: this.sessionUsageTracker.getCacheHitRate(),
+			autoCompactEnabled: this.settingsManager.getCompactionEnabled(),
 			extensionStatuses: this.footerDataProvider.getExtensionStatuses(),
 		};
 	}
@@ -6774,6 +6782,7 @@ export class InteractiveMode {
 
 	async renderInitialMessages(): Promise<void> {
 		const snapshot = await this.agentConnection.getInitialSnapshot();
+		this.sessionUsageTracker.seed(snapshot.messages ?? []);
 		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
 		const state = snapshot.state;
 		const streamingMessage = snapshot.streamingMessage;

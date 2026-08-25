@@ -4,6 +4,7 @@ import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { type SideQuestionEvent, startSideQuestion } from "../../../src/core/side-question.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
+import { SessionUsageTracker } from "../../../src/modes/interactive/agent-activity.js";
 import { BashExecutionComponent } from "../../../src/modes/interactive/components/bash-execution.js";
 import { SideQuestionComponent } from "../../../src/modes/interactive/components/side-question.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
@@ -348,6 +349,7 @@ describe("ENG-4509 side questions", () => {
 		const addTurn = vi.fn();
 		const firstTurn = { id: "turn-1", question: "First?", answer: "First answer", status: "complete" as const };
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			activeSideQuestionId: undefined,
 			sideQuestionEvent: firstTurn,
 			sideQuestionTurns: [firstTurn],
@@ -378,6 +380,7 @@ describe("ENG-4509 side questions", () => {
 		const showWarning = vi.fn();
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			defaultEditor,
 			editor: { getText: () => "", setText, addToHistory },
 			promptStashState: { stash: undefined },
@@ -405,6 +408,7 @@ describe("ENG-4509 side questions", () => {
 		const addToHistory = vi.fn();
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			defaultEditor,
 			editor: { getText: () => "", setText: vi.fn(), addToHistory },
 			uiServices: { settingsManager: { getTelemetryEnabled: vi.fn(() => false) } },
@@ -441,6 +445,7 @@ describe("ENG-4509 side questions", () => {
 			const addTurn = vi.fn();
 			const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 			const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+				sessionUsageTracker: new SessionUsageTracker(),
 				defaultEditor,
 				editor: { getText: () => "", setText: vi.fn(), addToHistory: vi.fn() },
 				promptStashState: { stash: undefined },
@@ -482,6 +487,7 @@ describe("ENG-4509 side questions", () => {
 		const executeBash = vi.fn(async () => {});
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			defaultEditor,
 			editor: { getText: () => "", setText: vi.fn(), addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
@@ -538,6 +544,7 @@ describe("ENG-4509 side questions", () => {
 
 	it("bounds side-bash output before seeding follow-up context", () => {
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionComponent: { finishBash: vi.fn() },
 			sideQuestionTurns: [],
 			sideQuestionBash: { runId: "side-run-1", input: "!generate-output", seedTranscript: true },
@@ -579,6 +586,7 @@ describe("ENG-4509 side questions", () => {
 
 	it("uses a safe markdown fence for side-bash output containing backticks", () => {
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionComponent: { finishBash: vi.fn() },
 			sideQuestionTurns: [],
 			sideQuestionBash: { runId: "side-run-1", input: "!show-fence", seedTranscript: true },
@@ -628,6 +636,7 @@ describe("ENG-4509 side questions", () => {
 		const showWarning = vi.fn();
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			defaultEditor,
 			editor: { getText: () => "", setText, addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
@@ -659,6 +668,7 @@ describe("ENG-4509 side questions", () => {
 		const showWarning = vi.fn();
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			defaultEditor,
 			editor: { getText: () => "", setText, addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
@@ -688,6 +698,7 @@ describe("ENG-4509 side questions", () => {
 		const setText = vi.fn();
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			defaultEditor,
 			editor: { getText: () => "", setText, addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
@@ -722,6 +733,7 @@ describe("ENG-4509 side questions", () => {
 	it("waits for a pending side bash to claim the slot before aborting it", () => {
 		const abortBash = vi.fn(async () => {});
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionEvent: { id: "turn-1", question: "First?", answer: "done", status: "complete" },
 			sideQuestionTurns: [],
 			sideQuestionComponent: {},
@@ -750,6 +762,7 @@ describe("ENG-4509 side questions", () => {
 	it("aborts a side bash immediately after observing its matching start", () => {
 		const abortBash = vi.fn(async () => {});
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionEvent: { id: "turn-1", question: "First?", answer: "done", status: "complete" },
 			sideQuestionTurns: [],
 			sideQuestionComponent: {},
@@ -786,6 +799,7 @@ describe("ENG-4509 side questions", () => {
 			const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 			const chatContainer = new Container();
 			const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+				sessionUsageTracker: new SessionUsageTracker(),
 				defaultEditor,
 				editor: { getText: () => "", setText: vi.fn(), addToHistory: vi.fn() },
 				promptStashState: { stash: undefined },
@@ -864,6 +878,7 @@ describe("ENG-4509 side questions", () => {
 		const bashComponent = { setComplete: vi.fn() };
 		const finishBash = vi.fn();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionBash: { runId: "side-run-1", input: "!sleep 5", seedTranscript: true },
 			sideQuestionBashComponent: bashComponent,
 			sideQuestionBashDiscarded: undefined,
@@ -916,6 +931,7 @@ describe("ENG-4509 side questions", () => {
 	it("re-aborts a discarded side bash when its bash_start arrives late", async () => {
 		const abortBash = vi.fn(async () => {});
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionBash: undefined,
 			sideQuestionBashDiscarded: "side-run-1",
 			activeBashComponent: undefined,
@@ -965,6 +981,7 @@ describe("ENG-4509 side questions", () => {
 		const abortBash = vi.fn(async () => {});
 		const chatContainer = new Container();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			// Our side bash was discarded at pane close but never claimed the slot.
 			sideQuestionBash: undefined,
 			sideQuestionBashDiscarded: "side-run-1",
@@ -1005,6 +1022,7 @@ describe("ENG-4509 side questions", () => {
 		const showError = vi.fn();
 		const chatContainer = new Container();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			// Our side bash is pending; its runId has not appeared yet.
 			sideQuestionBash: { runId: "side-run-1", input: "!ls", seedTranscript: true },
 			sideQuestionBashComponent: undefined,
@@ -1070,6 +1088,7 @@ describe("ENG-4509 side questions", () => {
 	it("keeps !! side-conversation bash display-only", async () => {
 		const finishBash = vi.fn();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			sideQuestionComponent: { finishBash },
 			sideQuestionTurns: [],
 			sideQuestionBash: { runId: "side-run-1", input: "!!pwd", seedTranscript: false },
@@ -1154,6 +1173,7 @@ describe("ENG-4509 side questions", () => {
 		const abortSideQuestion = vi.fn(async () => true);
 		const takeEscapeRepeatAction = vi.fn();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			activeSideQuestionId: "question-5",
 			sideQuestionEvent: {
 				id: "question-5",
@@ -1185,6 +1205,7 @@ describe("ENG-4509 side questions", () => {
 	it("waits for a cancelled run to settle before starting another side question", async () => {
 		const showWarning = vi.fn();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			activeSideQuestionId: "question-5",
 			showWarning,
 		});
@@ -1202,6 +1223,7 @@ describe("ENG-4509 side questions", () => {
 	it("reports side-question abort failures without rejecting the interrupt path", async () => {
 		const showError = vi.fn();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			activeSideQuestionId: "question-6",
 			sideQuestionEvent: {
 				id: "question-6",
@@ -1229,6 +1251,7 @@ describe("ENG-4509 side questions", () => {
 		const clearSideQuestion = vi.fn();
 		const setText = vi.fn();
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			sessionUsageTracker: new SessionUsageTracker(),
 			clearSideQuestion,
 			chatContainer: new Container(),
 			renderInitialMessages: vi.fn(async () => undefined),
