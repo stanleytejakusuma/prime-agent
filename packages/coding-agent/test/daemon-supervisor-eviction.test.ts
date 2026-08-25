@@ -2,9 +2,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getProcessStartId } from "../src/core/session-lease.js";
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
+import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
+import * as childProcessModule from "../src/utils/child-process.js";
 
 interface WorkerFixture {
 	descriptor: {
@@ -25,6 +28,28 @@ interface WorkerFixture {
 	summaries: Map<string, SessionSummary>;
 	intentionalStop: boolean;
 	updateRestartPrepareClient?: object;
+}
+
+/**
+ * A genuine ResidentWorker-shaped fixture (not the shallow WorkerFixture
+ * above), for the one test that exercises the real, un-mocked stopWorker.
+ */
+interface RealResidentWorkerFixture {
+	descriptor: DaemonWorkerDescriptor;
+	descriptorPath: string;
+	client?: {
+		request: ReturnType<typeof vi.fn>;
+		requestWorker: ReturnType<typeof vi.fn>;
+		close: ReturnType<typeof vi.fn>;
+	};
+	summaries: Map<string, SessionSummary>;
+	snapshotCache: Map<string, unknown>;
+	transcriptCaches: Map<string, unknown>;
+	snapshotGenerations: Map<string, Map<string, unknown>>;
+	snapshotLoads: Map<string, Promise<unknown>>;
+	intentionalStop: boolean;
+	stopRevision: number;
+	stopFinalization?: Promise<void>;
 }
 
 interface SupervisorInternals {
@@ -477,5 +502,129 @@ describe("daemon supervisor whole-tree eviction", () => {
 			}),
 		).rejects.toThrow('Ambiguous session selector "target"');
 		expect(supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+	});
+});
+
+describe("daemon supervisor idle eviction: real stop -> timeout -> finalizer chain", () => {
+	it("logs an eviction sweep timeout, then the background finalizer SIGKILLs and force-cleans up the same worker", async () => {
+		// Closes the gap between two previously separate proofs: the eviction test
+		// mocks stopWorker (only proves the sweep calls it), while the finalizer
+		// tests invoke scheduleWorkerStopFinalization directly (only proves the
+		// finalizer itself). This drives the real, un-mocked production path:
+		// runIdleEvictionSweep -> real stopWorker -> 2s graceful timeout ->
+		// scheduleWorkerStopFinalization -> 5s SIGKILL grace -> forced stopWorker
+		// cleanup, with a genuine ResidentWorker (not the shallow WorkerFixture).
+		vi.useFakeTimers();
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		vi.setSystemTime(now);
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-eviction-finalizer-"));
+		tempDirs.push(directory);
+		const descriptorDir = join(directory, "workers");
+		mkdirSync(directory, { recursive: true });
+		mkdirSync(descriptorDir, { recursive: true });
+		writeFileSync(join(directory, "settings.json"), JSON.stringify({ idleEvictionMinutes: 90 }));
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir,
+		}) as unknown as SupervisorInternals & {
+			workers: Map<string, RealResidentWorkerFixture>;
+			stopWorker(
+				worker: object,
+				removeDescriptor: boolean,
+				force?: boolean,
+				archiveSession?: boolean,
+			): Promise<void>;
+		};
+		supervisor.log = vi.fn();
+
+		const processStartId = getProcessStartId(process.pid);
+		if (processStartId === undefined) {
+			throw new Error("Could not identify test process");
+		}
+		const summary = makeSummary("idle-root", now);
+		const worker: RealResidentWorkerFixture = {
+			descriptor: {
+				version: 2,
+				workerId: "idle",
+				pid: process.pid,
+				processStartId,
+				rootActiveSessionId: "idle-root",
+				rootSessionId: "idle-root-session",
+				socketPath: join(directory, "worker-idle.sock"),
+				recoveryJournalPath: join(descriptorDir, "idle.recovery.jsonl"),
+				supervisorSocketPath: join(directory, "daemon.sock"),
+				authenticationToken: "test-token",
+				createdAt: new Date(now).toISOString(),
+				updatedAt: new Date(now).toISOString(),
+				lifecycle: "ready",
+				createCommand: { type: "create" },
+				consecutiveFailures: 0,
+			},
+			descriptorPath: join(descriptorDir, "idle.json"),
+			client: {
+				request: vi.fn(async () => success(undefined, "list", { sessions: [summary] })),
+				requestWorker: vi.fn(),
+				close: vi.fn(),
+			},
+			summaries: new Map([["idle-root", summary]]),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		supervisor.workers.set("idle", worker);
+
+		// The worker process never actually exits: liveness stays true through the
+		// graceful window and the finalizer's own wait, only flipping false once
+		// SIGKILL is observed. Using the real test process pid keeps
+		// processIdExists() truthful; only the liveness/signal decision is mocked.
+		let alive = true;
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockImplementation(() => alive);
+		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation((_pid, signal) => {
+			if (signal === "SIGKILL") alive = false;
+		});
+
+		try {
+			const sweep = supervisor.runIdleEvictionSweep(now).catch((error: unknown) => error);
+
+			// The real stopWorker sends SIGTERM, then polls for up to 2s (non-force
+			// graceful deadline) before giving up and scheduling the finalizer.
+			await vi.advanceTimersByTimeAsync(2100);
+			const sweepResult = await sweep;
+
+			// The scheduled sweep's own catch logs and swallows the timeout instead of
+			// throwing "Evicted idle worker" (that log only fires on a successful
+			// awaited stop) -- runIdleEvictionSweep itself rejects with the timeout,
+			// the caller (scheduleIdleEvictionSweep) is what logs and swallows it.
+			expect(sweepResult).toBeInstanceOf(Error);
+			expect((sweepResult as Error).message).toContain("did not stop");
+
+			// The worker must still be registered (tombstoned, not deleted) with the
+			// finalizer armed in the background -- premature cleanup would strand
+			// state or double-run the stop.
+			expect(supervisor.workers.has("idle")).toBe(true);
+			expect(worker.descriptor.stopRequestedAt).toBeDefined();
+			expect(worker.stopFinalization).toBeDefined();
+			const finalization = worker.stopFinalization;
+
+			// Advance well past the finalizer's 5s SIGKILL grace period, its 500ms
+			// liveness-cache throttle, and the bounded graceful/force deadlines of
+			// the retry stopWorker call it makes afterward.
+			await vi.advanceTimersByTimeAsync(15_000);
+			await finalization;
+
+			expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGKILL");
+			// Forced cleanup actually ran and deregistered the worker.
+			expect(supervisor.workers.has("idle")).toBe(false);
+			expect(worker.stopFinalization).toBeUndefined();
+		} finally {
+			existsSpy.mockRestore();
+			aliveSpy.mockRestore();
+			killSpy.mockRestore();
+			vi.useRealTimers();
+		}
 	});
 });
