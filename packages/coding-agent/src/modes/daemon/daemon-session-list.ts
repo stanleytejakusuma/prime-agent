@@ -2,7 +2,7 @@ import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { compactRlmText, rlmChildLabel } from "../../core/agent-session.js";
+import { type AgentSession, compactRlmText, rlmChildLabel } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
 import { type AgentCronJob, isHeartbeatCronJob } from "../../core/cron-jobs.js";
@@ -25,6 +25,26 @@ export type SessionRosterStatus = "running" | "idle" | "inactive";
 // enough for real spawn cells while keeping the daemon wire payload bounded.
 const SPAWN_CODE_MAX_CHARS = 4000;
 const MAX_DATE_TIMESTAMP_MS = 8.64e15;
+
+/**
+ * Per-session cumulative usage snapshot for the agents-view status footer (pi
+ * parity, Phase 2). Mirrors the client-side SessionUsageTotals derivation so
+ * the roster can show the same token/cache/cost numbers as the chat footer
+ * without attaching to the session. Only included on `list` rows when the
+ * requesting client advertises the "session_usage_snapshot" capability.
+ */
+export interface SessionUsageSnapshot {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	/** Aggregate cache hit rate: cacheRead / (input + cacheRead + cacheWrite) * 100. */
+	cacheHitRate: number | null;
+	contextTokens: number | null;
+	contextWindow: number;
+	contextPercent: number | null;
+}
 
 // Lightweight daemon session shape used by list, create, rename, attach, and state responses.
 export interface SessionSummary {
@@ -81,6 +101,9 @@ export interface SessionSummary {
 	workerState?: "starting" | "ready" | "recovering" | "stopping" | "failed";
 	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
 	workerPid?: number;
+	/** Optional per-session usage snapshot; present only when the requesting
+	 * client advertised "session_usage_snapshot" on the list command. */
+	usageSnapshot?: SessionUsageSnapshot;
 }
 
 /**
@@ -115,6 +138,7 @@ export function buildSessionList(
 	activeSessions: readonly ActiveSessionState[],
 	savedSessions: readonly SessionInfo[],
 	scheduledJobs: readonly AgentCronJob[] = [],
+	includeUsageSnapshot = false,
 ): SessionSummary[] {
 	const activeBySessionFile = new Map<string, ActiveSessionState>();
 	const heartbeatSessionIds = new Set<string>();
@@ -157,6 +181,7 @@ export function buildSessionList(
 						registeredHeartbeatSessionFiles.has(sessionFile),
 					registeredCronSessionIds.has(activeSession.activeSessionId) ||
 						registeredCronSessionFiles.has(sessionFile),
+					includeUsageSnapshot,
 				),
 			);
 			seenActiveSessionIds.add(activeSession.activeSessionId);
@@ -184,6 +209,7 @@ export function buildSessionList(
 						(resolvedSessionFile !== undefined && registeredHeartbeatSessionFiles.has(resolvedSessionFile)),
 					registeredCronSessionIds.has(activeSession.activeSessionId) ||
 						(resolvedSessionFile !== undefined && registeredCronSessionFiles.has(resolvedSessionFile)),
+					includeUsageSnapshot,
 				),
 			);
 		}
@@ -197,6 +223,7 @@ export function summaryForActiveSession(
 	hasActiveHeartbeat = false,
 	hasRegisteredHeartbeat = hasActiveHeartbeat,
 	hasRegisteredCronJob = false,
+	includeUsageSnapshot = false,
 ): SessionSummary {
 	const session = activeSession.runtime.session;
 	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
@@ -267,6 +294,69 @@ export function summaryForActiveSession(
 		// that is active again.
 		summary: activeSession.summaryState?.summary,
 		...(isSummaryCurrent(activeSession) ? { taskState: activeSession.summaryState?.taskState } : {}),
+		...(includeUsageSnapshot ? { usageSnapshot: computeSessionUsageSnapshot(session) } : {}),
+	};
+}
+
+/**
+ * Derive the cumulative usage snapshot for a resident session without touching
+ * its event stream. Totals mirror the client-side SessionUsageTracker: every
+ * message carrying an input/output/cacheRead/cacheWrite usage object (assistant
+ * and tool-result style) accumulates, and the cache hit rate is the aggregate
+ * ratio, not the last message. Context utilization reuses the session's own
+ * compaction-aware getContextUsage(). Returns undefined when the session has
+ * neither usage data nor a context estimate so the wire stays lean.
+ */
+function computeSessionUsageSnapshot(session: AgentSession): SessionUsageSnapshot | undefined {
+	let input = 0;
+	let output = 0;
+	let cacheRead = 0;
+	let cacheWrite = 0;
+	let cost = 0;
+	let hasData = false;
+	for (const message of session.messages) {
+		const usage = (message as { usage?: unknown }).usage as
+			| {
+					input?: number;
+					output?: number;
+					cacheRead?: number;
+					cacheWrite?: number;
+					cost?: { total?: number };
+			  }
+			| undefined;
+		if (!usage || typeof usage !== "object") {
+			continue;
+		}
+		const messageInput = usage.input ?? 0;
+		const messageOutput = usage.output ?? 0;
+		const messageCacheRead = usage.cacheRead ?? 0;
+		const messageCacheWrite = usage.cacheWrite ?? 0;
+		if (messageInput === 0 && messageOutput === 0 && messageCacheRead === 0 && messageCacheWrite === 0) {
+			continue;
+		}
+		input += messageInput;
+		output += messageOutput;
+		cacheRead += messageCacheRead;
+		cacheWrite += messageCacheWrite;
+		cost += usage.cost?.total ?? 0;
+		hasData = true;
+	}
+	const context = session.getContextUsage?.();
+	if (!hasData && !context) {
+		return undefined;
+	}
+	const promptTokens = input + cacheRead + cacheWrite;
+	const cacheHitRate = hasData && promptTokens > 0 ? (cacheRead / promptTokens) * 100 : null;
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		cost,
+		cacheHitRate: cacheHitRate !== null && Number.isFinite(cacheHitRate) ? cacheHitRate : null,
+		contextTokens: context?.tokens ?? null,
+		contextWindow: context?.contextWindow ?? 0,
+		contextPercent: context?.percent ?? null,
 	};
 }
 

@@ -68,8 +68,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
-export const DAEMON_SCHEMA_REVISION = 22;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-7cda8d7e97b4";
+// Revision 23 adds an optional, client capability-gated per-session usage
+// snapshot (token/cache/cost totals plus context utilization) to `list`
+// responses, powering the agents-view status footer (pi-style parity).
+export const DAEMON_SCHEMA_REVISION = 23;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-d21ee07d0610";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -87,7 +90,10 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
+	| "client_owned_sessions"
+	// The client understands `usageSnapshot` on session rows and asks the daemon
+	// to include it in `list` responses (agents-view status footer).
+	| "session_usage_snapshot";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -146,6 +152,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"session_usage_snapshot",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -383,6 +390,10 @@ export type DaemonCommand =
 			cwd?: string;
 			sessionDir?: string;
 			includeClientOwned?: boolean;
+			/** Client capability advertisement; the daemon only enriches rows the
+			 * client asked for (e.g. "session_usage_snapshot"). Optional for
+			 * backward compatibility with older clients. */
+			capabilities?: readonly DaemonClientCapability[];
 	  }
 	| DaemonSavedSessionListCommand
 	| ({
