@@ -136,6 +136,23 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("acp_mcp_servers");
 	});
 
+	it("capability-gates the extension shortcuts surface independently from schema revision", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_extension_shortcuts).toEqual({
+			minProtocol: 7,
+			capability: "extension_shortcuts",
+		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.run_extension_shortcut).toEqual({
+			minProtocol: 7,
+			capability: "extension_shortcuts",
+		});
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.extension_shortcuts_changed).toEqual({
+			minProtocol: 7,
+			capability: "extension_shortcuts",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("extension_shortcuts");
+		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(17);
+	});
+
 	it("capability-gates the optional model catalog surface", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_model_catalog).toEqual({
 			minProtocol: 7,

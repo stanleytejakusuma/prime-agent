@@ -30,6 +30,7 @@ import type {
 	ExtensionFlag,
 	ExtensionRuntime,
 	ExtensionShortcut,
+	ExtensionShortcutDescriptor,
 	ExtensionUIContext,
 	InputEvent,
 	InputEventResult,
@@ -102,6 +103,27 @@ const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltI
 	}
 	return builtinKeybindings;
 };
+
+/**
+ * Resolve daemon-published raw shortcut descriptors with the same client-local
+ * keybinding policy as ExtensionRunner.getShortcuts(). A reserved built-in
+ * always wins; a non-reserved built-in may be overridden; later extension
+ * descriptors win duplicate keys. This is deliberately handler-free so it is
+ * safe to run in a daemon-attached client.
+ */
+export function resolveExtensionShortcutDescriptors(
+	descriptors: Iterable<ExtensionShortcutDescriptor>,
+	resolvedKeybindings: KeybindingsConfig,
+): Map<KeyId, ExtensionShortcutDescriptor> {
+	const builtinKeybindings = buildBuiltinKeybindings(resolvedKeybindings);
+	const resolved = new Map<KeyId, ExtensionShortcutDescriptor>();
+	for (const descriptor of descriptors) {
+		const key = descriptor.shortcut.toLowerCase() as KeyId;
+		if (builtinKeybindings[key]?.restrictOverride === true) continue;
+		resolved.set(key, descriptor);
+	}
+	return resolved;
+}
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -462,6 +484,60 @@ export class ExtensionRunner {
 			}
 		}
 		return extensionShortcuts;
+	}
+
+	/**
+	 * Resolve a handler-free descriptor list using the same client-local
+	 * built-in policy as getShortcuts(). Kept on ExtensionRunner so daemon
+	 * clients cannot accidentally grow a second, divergent conflict resolver.
+	 */
+	static resolveShortcutDescriptors(
+		descriptors: Iterable<ExtensionShortcutDescriptor>,
+		resolvedKeybindings: KeybindingsConfig,
+	): Map<KeyId, ExtensionShortcutDescriptor> {
+		return resolveExtensionShortcutDescriptors(descriptors, resolvedKeybindings);
+	}
+
+	/**
+	 * Raw, unresolved extension-declared shortcuts: key, description, and
+	 * extensionPath only (no handler, no built-in keybinding conflict
+	 * resolution). Serializable, so a daemon can publish it to clients that
+	 * cannot hold the real handler closures (Option B of the daemon-shortcuts
+	 * fix: conflict resolution against built-ins stays client-side, exactly as
+	 * getShortcuts() already does it locally).
+	 */
+	getRawShortcuts(): ExtensionShortcutDescriptor[] {
+		const descriptors: ExtensionShortcutDescriptor[] = [];
+		for (const ext of this.extensions) {
+			for (const [key, shortcut] of ext.shortcuts) {
+				descriptors.push({
+					shortcut: key,
+					description: shortcut.description,
+					extensionPath: shortcut.extensionPath,
+				});
+			}
+		}
+		return descriptors;
+	}
+
+	/**
+	 * Find the current winning shortcut by normalized key and the descriptor's
+	 * extension identity. The path is compared only as an opaque identity
+	 * token. It is never opened, resolved, or otherwise used as a filesystem
+	 * input. Requiring both values prevents a client with a stale registry from
+	 * firing another extension that later claimed the same key.
+	 */
+	findShortcutByKeyAndExtensionPath(key: KeyId, extensionPath: string): ExtensionShortcut | undefined {
+		const normalizedKey = key.toLowerCase() as KeyId;
+		let match: ExtensionShortcut | undefined;
+		for (const ext of this.extensions) {
+			for (const [candidateKey, shortcut] of ext.shortcuts) {
+				if (candidateKey.toLowerCase() === normalizedKey) {
+					match = shortcut;
+				}
+			}
+		}
+		return match?.extensionPath === extensionPath ? match : undefined;
 	}
 
 	getShortcutDiagnostics(): ResourceDiagnostic[] {

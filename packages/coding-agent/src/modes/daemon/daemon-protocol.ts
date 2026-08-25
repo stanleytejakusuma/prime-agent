@@ -61,14 +61,15 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
-// Revision 17 gates authoritative child rosters and transient owned-session recovery context.
+// Revision 17 adds get_extension_shortcuts/run_extension_shortcut commands and the
+// extension_shortcuts_changed invalidation event, capability-gated on "extension_shortcuts".
 // Revision 18 adds the opt-in RLM quiescence barrier to headless completion.
 // Revision 19 adds daemon-held session input pauses.
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
 export const DAEMON_SCHEMA_REVISION = 22;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-4d515169dc6b";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-7cda8d7e97b4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -108,6 +109,12 @@ export type DaemonServerCapability =
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
 	| "queue_message_mutation"
+	// The daemon serves the raw, unresolved extension shortcut registry
+	// (get_extension_shortcuts), executes a matched shortcut's real handler on
+	// request (run_extension_shortcut), and pushes extension_shortcuts_changed
+	// invalidation pings. Clients must check before relying on daemon-attached
+	// extension shortcuts (Option B of the daemon-shortcuts fix).
+	| "extension_shortcuts"
 	| "authoritative_child_roster"
 	| "owned_session_recovery_context"
 	| "rlm_quiescence_barrier"
@@ -153,6 +160,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"prompt_admission_cancellation",
 	"owned_prompt_cancellation",
 	"queue_message_mutation",
+	"extension_shortcuts",
 	"authoritative_child_roster",
 	"owned_session_recovery_context",
 	"rlm_quiescence_barrier",
@@ -643,6 +651,8 @@ export type DaemonCommand =
 	| { id?: string; type: "get_last_assistant_text"; activeSessionId: string }
 	| { id?: string; type: "get_system_prompt"; activeSessionId: string }
 	| { id?: string; type: "get_tool_definition"; activeSessionId: string; name: string }
+	| { id?: string; type: "get_extension_shortcuts"; activeSessionId: string }
+	| { id?: string; type: "run_extension_shortcut"; activeSessionId: string; key: string; extensionPath: string }
 	| { id?: string; type: "set_session_entry_label"; activeSessionId: string; entryId: string; label?: string }
 	| {
 			id?: string;
@@ -689,6 +699,13 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
+} as const;
+const EXTENSION_SHORTCUTS_COMMAND = {
+	minProtocol: 7,
+	// The capability advertises the full command/event surface. Do not also
+	// gate on schema revision: a daemon can safely backport this capability
+	// without claiming every unrelated revision-17 schema change.
+	capability: "extension_shortcuts",
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
@@ -810,6 +827,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_last_assistant_text: LEGACY_DAEMON_COMMAND,
 	get_system_prompt: LEGACY_DAEMON_COMMAND,
 	get_tool_definition: LEGACY_DAEMON_COMMAND,
+	get_extension_shortcuts: EXTENSION_SHORTCUTS_COMMAND,
+	run_extension_shortcut: EXTENSION_SHORTCUTS_COMMAND,
 	set_session_entry_label: LEGACY_DAEMON_COMMAND,
 	extension_ui_response: LEGACY_DAEMON_COMMAND,
 	prepare_update_restart: LEGACY_DAEMON_COMMAND,
@@ -946,6 +965,7 @@ export type DaemonOutbound =
 	  }
 	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "heartbeats_changed" }
+	| { type: "extension_shortcuts_changed"; activeSessionId: string }
 	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
 	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
@@ -1028,6 +1048,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	daemon_hello: LEGACY_DAEMON_COMMAND,
 	daemon_closing: LEGACY_DAEMON_COMMAND,
 	heartbeats_changed: { minProtocol: 7, capability: "heartbeat_catalog" },
+	extension_shortcuts_changed: EXTENSION_SHORTCUTS_COMMAND,
 	session_event: LEGACY_DAEMON_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,
 	session_status: LEGACY_DAEMON_COMMAND,
@@ -1132,6 +1153,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_system_prompt",
 	"get_rlm_max_depth_status",
 	"get_tool_definition",
+	"get_extension_shortcuts",
 ]);
 
 export function isDaemonMutatingCommand(command: Pick<DaemonCommand, "type">): boolean {

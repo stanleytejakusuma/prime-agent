@@ -1266,6 +1266,18 @@ export interface ExtensionShortcut {
 	extensionPath: string;
 }
 
+/**
+ * Serializable projection of ExtensionShortcut with the handler dropped.
+ * Used to publish raw, unresolved extension-declared shortcuts (before
+ * built-in keybinding conflict resolution) across the daemon<->client wire,
+ * where handler functions cannot be transmitted.
+ */
+export interface ExtensionShortcutDescriptor {
+	shortcut: KeyId;
+	description?: string;
+	extensionPath: string;
+}
+
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(

@@ -816,4 +816,126 @@ describe("ExtensionRunner", () => {
 			expect(runner.hasHandlers("agent_end")).toBe(false);
 		});
 	});
+
+	describe("getRawShortcuts", () => {
+		it("returns handler-free descriptors for every extension-declared shortcut, unresolved against built-ins", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.registerShortcut("ctrl+c", {
+						description: "Conflicts with built-in but still raw-listed",
+						handler: async () => {},
+					});
+					pi.registerShortcut("ctrl+shift+x", {
+						description: "Ordinary shortcut",
+						handler: async () => {},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "raw.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			const descriptors = runner.getRawShortcuts();
+			// No handler field anywhere -- these must be JSON-serializable for the wire.
+			for (const descriptor of descriptors) {
+				expect(descriptor).not.toHaveProperty("handler");
+				expect(() => JSON.stringify(descriptor)).not.toThrow();
+			}
+			expect(descriptors).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						shortcut: "ctrl+c",
+						description: "Conflicts with built-in but still raw-listed",
+					}),
+					expect.objectContaining({ shortcut: "ctrl+shift+x", description: "Ordinary shortcut" }),
+				]),
+			);
+			// Unlike getShortcuts(), the built-in conflict skips getShortcuts()
+			// applies to "ctrl+c" do not apply here: it is still raw-listed.
+			expect(runner.getShortcuts(defaultKeybindings).has("ctrl+c")).toBe(false);
+		});
+
+		it("returns an empty list when no extension registers a shortcut", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			expect(runner.getRawShortcuts()).toEqual([]);
+		});
+	});
+
+	describe("resolveShortcutDescriptors", () => {
+		it("applies the local reserved built-in conflict policy to raw descriptors", () => {
+			const resolved = ExtensionRunner.resolveShortcutDescriptors(
+				[
+					{ shortcut: "ctrl+c" as KeyId, extensionPath: "/tmp/reserved.ts" },
+					{ shortcut: "ctrl+e" as KeyId, extensionPath: "/tmp/safe.ts" },
+				],
+				{ "app.clear": "ctrl+c" as KeyId },
+			);
+
+			expect(resolved.has("ctrl+c" as KeyId)).toBe(false);
+			expect(resolved.get("ctrl+e" as KeyId)?.extensionPath).toBe("/tmp/safe.ts");
+		});
+
+		it("keeps the last descriptor for duplicate normalized keys", () => {
+			const resolved = ExtensionRunner.resolveShortcutDescriptors(
+				[
+					{ shortcut: "CTRL+E" as KeyId, extensionPath: "/tmp/first.ts" },
+					{ shortcut: "ctrl+e" as KeyId, extensionPath: "/tmp/last.ts" },
+				],
+				{},
+			);
+
+			expect(resolved).toEqual(
+				new Map([["ctrl+e" as KeyId, { shortcut: "ctrl+e" as KeyId, extensionPath: "/tmp/last.ts" }]]),
+			);
+		});
+	});
+
+	describe("findShortcutByKeyAndExtensionPath", () => {
+		it("finds the current winning shortcut only when both normalized key and extension identity match", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.registerShortcut("ctrl+shift+z", {
+						description: "Direct lookup target",
+						handler: async () => {},
+					});
+				}
+			`;
+			const extensionPath = path.join(extensionsDir, "lookup.ts");
+			fs.writeFileSync(extensionPath, extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			const found = runner.findShortcutByKeyAndExtensionPath("CTRL+SHIFT+Z" as KeyId, extensionPath);
+			expect(found?.description).toBe("Direct lookup target");
+			expect(typeof found?.handler).toBe("function");
+			expect(runner.findShortcutByKeyAndExtensionPath("ctrl+shift+z" as KeyId, "/tmp/stale.ts")).toBeUndefined();
+		});
+
+		it("does not let a stale descriptor select an older extension after a newer extension claims its key", async () => {
+			const firstPath = path.join(extensionsDir, "first.ts");
+			const lastPath = path.join(extensionsDir, "last.ts");
+			fs.writeFileSync(
+				firstPath,
+				`export default function(pi) { pi.registerShortcut("ctrl+e", { handler: async () => {} }); }`,
+			);
+			fs.writeFileSync(
+				lastPath,
+				`export default function(pi) { pi.registerShortcut("ctrl+e", { handler: async () => {} }); }`,
+			);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			expect(runner.findShortcutByKeyAndExtensionPath("ctrl+e" as KeyId, firstPath)).toBeUndefined();
+			expect(runner.findShortcutByKeyAndExtensionPath("ctrl+e" as KeyId, lastPath)?.extensionPath).toBe(lastPath);
+		});
+
+		it("returns undefined for an unregistered key", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			expect(runner.findShortcutByKeyAndExtensionPath("ctrl+z" as KeyId, "/tmp/missing.ts")).toBeUndefined();
+		});
+	});
 });
