@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AnthropicMessagesCompat, Api, Context, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
-import { getApiProvider } from "@earendil-works/pi-ai";
+import { getApiProvider, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { getOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -439,6 +439,137 @@ describe("ModelRegistry", () => {
 			expect(model?.thinkingLevelMap).toEqual({ minimal: null, high: "max" });
 			expect(compat?.supportsStrictMode).toBe(false);
 			expect(compat?.cacheControlFormat).toBe("anthropic");
+		});
+		test("custom models expose handoff-verified thinking tiers (fork todos #44/#45)", () => {
+			writeRawModelsJson({
+				omniroute: {
+					baseUrl: "http://127.0.0.1:20128/v1",
+					apiKey: "DEMO_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "deepseek-v4-pro",
+							reasoning: true,
+							input: ["text"],
+							contextWindow: 1000000,
+							maxTokens: 384000,
+							thinkingLevelMap: {
+								off: "none",
+								minimal: null,
+								low: "low",
+								medium: null,
+								high: "high",
+								xhigh: null,
+								max: "max",
+							},
+						},
+						{
+							id: "deepseek-v4-flash",
+							reasoning: true,
+							input: ["text"],
+							contextWindow: 1000000,
+							maxTokens: 384000,
+							thinkingLevelMap: {
+								off: "none",
+								minimal: null,
+								low: "low",
+								medium: null,
+								high: "high",
+								xhigh: null,
+								max: "max",
+							},
+						},
+						{
+							id: "agent-fallback",
+							reasoning: true,
+							input: ["text"],
+							contextWindow: 272000,
+							maxTokens: 65536,
+							thinkingLevelMap: {
+								off: "none",
+								minimal: null,
+								low: null,
+								medium: null,
+								high: null,
+								xhigh: null,
+								max: null,
+							},
+						},
+						{
+							id: "claude-opus-4-8",
+							reasoning: true,
+							input: ["text", "image"],
+							contextWindow: 1000000,
+							maxTokens: 128000,
+							thinkingLevelMap: {
+								off: "none",
+								minimal: "low",
+								low: "low",
+								medium: "medium",
+								high: "high",
+								xhigh: "xhigh",
+								max: "xhigh",
+							},
+						},
+						{
+							id: "auto/gemini",
+							reasoning: false,
+							input: ["text"],
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+
+			const deepseek = registry.find("omniroute", "deepseek-v4-pro");
+			expect(deepseek?.thinkingLevelMap).toEqual({
+				off: "none",
+				minimal: null,
+				low: "low",
+				medium: null,
+				high: "high",
+				xhigh: null,
+				max: "max",
+			});
+
+			const fallback = registry.find("omniroute", "agent-fallback");
+			expect(fallback?.reasoning).toBe(true);
+			// Handoff: the chain reasons but exposes no user-controllable effort tiers,
+			// so every level except off is null-mapped and the picker shows only ["off"].
+			// ctx/maxTokens keep the gateway-verified chain caps (272000/65536) instead
+			// of letting ModelRegistry substitute its smaller 128000/16384 defaults.
+			expect(fallback?.thinkingLevelMap).toEqual({
+				off: "none",
+				minimal: null,
+				low: null,
+				medium: null,
+				high: null,
+				xhigh: null,
+				max: null,
+			});
+			expect(fallback?.contextWindow).toBe(272000);
+			expect(fallback?.maxTokens).toBe(65536);
+			expect(getSupportedThinkingLevels(fallback!)).toEqual(["off"]);
+
+			const deepseekFlash = registry.find("omniroute", "deepseek-v4-flash");
+			expect(deepseekFlash?.thinkingLevelMap).toEqual(deepseek?.thinkingLevelMap);
+			expect(getSupportedThinkingLevels(deepseekFlash!)).toEqual(["off", "low", "high", "max"]);
+			expect(getSupportedThinkingLevels(deepseek!)).toEqual(["off", "low", "high", "max"]);
+
+			const opus48 = registry.find("omniroute", "claude-opus-4-8");
+			expect(opus48).toBeDefined();
+			expect(opus48?.reasoning).toBe(true);
+			expect(opus48?.contextWindow).toBe(1000000);
+			expect(opus48?.maxTokens).toBe(128000);
+			expect(opus48?.input).toContain("image");
+			// Safe interim: gateway version unconfirmed, so claude max stays xhigh upstream.
+			expect(opus48?.thinkingLevelMap?.max).toBe("xhigh");
+
+			const gemini = registry.find("omniroute", "auto/gemini");
+			expect(gemini?.reasoning).toBe(false);
+			expect(getSupportedThinkingLevels(gemini!)).toEqual(["off"]);
 		});
 
 		test("compat schema accepts Anthropic eager tool input streaming flag", () => {
