@@ -5,6 +5,14 @@ import { classifySessionRosterStatus, type SessionSummary } from "../daemon/daem
 
 export type AgentsViewSection = "running" | "idle" | "inactive";
 
+/**
+ * Per-section manual pin order, keyed by row identity (getAgentsViewSummaryIdentity).
+ * A section absent from this map has no pins yet; sessions not listed in a
+ * present section's array are "unplaced" and interleave around the pinned
+ * rows by heuristic position (see orderSectionRows).
+ */
+export type AgentsViewManualOrder = Partial<Record<AgentsViewSection, string[]>>;
+
 export interface UnifiedSessionHeartbeat {
 	activeCount: number;
 	nextRunAt?: string;
@@ -629,6 +637,7 @@ export function buildAgentsViewRows(
 	expandedSubagentParents: ReadonlySet<string> = new Set(),
 	programShownParents: ReadonlySet<string> = new Set(),
 	scope?: AgentsViewScopeKey,
+	manualOrder?: AgentsViewManualOrder,
 ): AgentsViewRow[] {
 	const inputs = summariesOrRecords.map((input) =>
 		isUnifiedSessionRecord(input) ? { summary: summaryForUnifiedRecord(input), record: input } : { summary: input },
@@ -718,7 +727,10 @@ export function buildAgentsViewRows(
 	};
 	const scopedRootRow = scopeRoot ? baseRows.find((row) => row.summary === scopeRoot.summary) : undefined;
 	const visibleRoots = scopedRootRow ? roots.filter((row) => row !== scopedRootRow) : roots;
-	for (const root of visibleRoots.sort(compareAgentsViewRows)) {
+	// Scoped rows are a subset of the global section. Applying global pins here
+	// would make filtered adjacency become persisted global order, so scoped
+	// views use the regular heuristic and do not expose reordering controls.
+	for (const root of orderAgentsViewRoots(visibleRoots, scope ? undefined : manualOrder)) {
 		emit(root, 0);
 	}
 	return flattened;
@@ -871,6 +883,199 @@ function compareAgentsViewRows(a: AgentsViewRow, b: AgentsViewRow): number {
 	}
 	return a.summary.sessionId.localeCompare(b.summary.sessionId);
 }
+
+/**
+ * Order one section's top-level rows with manual pins layered over the
+ * heuristic order. Deliberately NOT a comparator: a comparator that mixes
+ * "compare by pinned index" for placed rows with "compare by heuristic" for
+ * unplaced rows is not transitively consistent -- two placed rows can each
+ * heuristically sort on opposite sides of some unplaced row, which produces
+ * a sort cycle and makes `.sort()` output nondeterministic. This instead
+ * treats `pinned` as a fixed sequence and, for each unplaced row, inserts it
+ * immediately before the first pinned row it heuristically precedes (or at
+ * the end, if none). Every comparison is pinned-vs-unplaced; pinned rows are
+ * never compared against each other (so their manual order always wins,
+ * even where it disagrees with the heuristic) and unplaced rows are never
+ * compared against each other beyond the initial heuristic sort, so the
+ * result is deterministic for a given `rows`/`pinned` pair.
+ *
+ * `rows` need not be pre-sorted and may belong to only one section (this is
+ * meant to be called once per section). `pinned` identities absent from
+ * `rows` are dropped so a currently-invisible pin does not leave a gap. Once
+ * a section is seeded, later unplaced arrivals use their heuristic position,
+ * so a newer arrival can appear above the user's current topmost pin.
+ */
+export function orderSectionRows(
+	rows: readonly AgentsViewRow[],
+	pinned: readonly string[] | undefined,
+): AgentsViewRow[] {
+	if (!pinned || pinned.length === 0) {
+		return [...rows].sort(compareAgentsViewRows);
+	}
+	const byIdentity = new Map(rows.map((row) => [row.identity, row] as const));
+	const pinnedRows = pinned.map((identity) => byIdentity.get(identity)).filter((row): row is AgentsViewRow => !!row);
+	if (pinnedRows.length === 0) {
+		return [...rows].sort(compareAgentsViewRows);
+	}
+	const pinnedSet = new Set(pinnedRows.map((row) => row.identity));
+	const unplacedRows = rows.filter((row) => !pinnedSet.has(row.identity)).sort(compareAgentsViewRows);
+
+	const before: AgentsViewRow[][] = pinnedRows.map(() => []);
+	const afterAll: AgentsViewRow[] = [];
+	for (const row of unplacedRows) {
+		const slot = pinnedRows.findIndex((pinnedRow) => compareAgentsViewRows(row, pinnedRow) < 0);
+		if (slot === -1) {
+			afterAll.push(row);
+		} else {
+			before[slot]!.push(row);
+		}
+	}
+	const result: AgentsViewRow[] = [];
+	for (const [index, pinnedRow] of pinnedRows.entries()) {
+		result.push(...before[index]!);
+		result.push(pinnedRow);
+	}
+	result.push(...afterAll);
+	return result;
+}
+
+/** Order every section's top-level rows and concatenate section blocks (running, idle, inactive). */
+export function orderAgentsViewRoots(
+	roots: readonly AgentsViewRow[],
+	manualOrder: AgentsViewManualOrder | undefined,
+): AgentsViewRow[] {
+	const bySection = new Map<AgentsViewSection, AgentsViewRow[]>();
+	for (const row of roots) {
+		const list = bySection.get(row.section) ?? [];
+		list.push(row);
+		bySection.set(row.section, list);
+	}
+	const result: AgentsViewRow[] = [];
+	for (const section of AGENTS_VIEW_SECTIONS) {
+		const sectionRows = bySection.get(section);
+		if (!sectionRows) continue;
+		result.push(...orderSectionRows(sectionRows, manualOrder?.[section]));
+	}
+	return result;
+}
+
+/**
+ * Insert `identity` into a pinned array at the position consistent with its
+ * place in `displayOrder`, if it is not pinned already. Pinned entries with
+ * no current match in `displayOrder` (a session that temporarily left the
+ * section) are inert here: they never trigger the insertion point, so they
+ * neither block nor misplace the newly pinned identity.
+ */
+function ensureAgentsViewIdentityPinned(
+	pinned: readonly string[],
+	identity: string,
+	displayOrder: readonly string[],
+): string[] {
+	if (pinned.includes(identity)) {
+		return [...pinned];
+	}
+	const displayIndex = displayOrder.indexOf(identity);
+	let insertAt = pinned.length;
+	if (displayIndex >= 0) {
+		const nextIndex = pinned.findIndex((pinnedIdentity) => {
+			const pinnedDisplayIndex = displayOrder.indexOf(pinnedIdentity);
+			return pinnedDisplayIndex >= 0 && pinnedDisplayIndex > displayIndex;
+		});
+		if (nextIndex >= 0) insertAt = nextIndex;
+	}
+	const next = [...pinned];
+	next.splice(insertAt, 0, identity);
+	return next;
+}
+
+/**
+ * Compute a section's manual order after swapping two display-adjacent
+ * identities. `displayOrder` is that section's current effective top-level
+ * order (`orderSectionRows` output, mapped to identities) at the moment of
+ * the keypress. Either identity may already be pinned or not; either way
+ * both end up pinned and swapped, seeding the array on first use per the
+ * spec. An invisible pin between the pair remains in the array, so this swap
+ * can change that hidden entry's relative position to both visible entries.
+ * Callers must pass identities that are actually display-adjacent; this
+ * function does not itself verify adjacency.
+ */
+export function applyAgentsViewManualMove(
+	pinned: readonly string[] | undefined,
+	displayOrder: readonly string[],
+	movedIdentity: string,
+	neighborIdentity: string,
+): string[] {
+	// First use: seed from the full current effective order (spec step 2), not
+	// just the moved pair, so every other row keeps its current relative
+	// position instead of collapsing to "only these two are pinned".
+	let next = pinned ? [...pinned] : [...displayOrder];
+	next = ensureAgentsViewIdentityPinned(next, neighborIdentity, displayOrder);
+	next = ensureAgentsViewIdentityPinned(next, movedIdentity, displayOrder);
+	const movedIndex = next.indexOf(movedIdentity);
+	const neighborIndex = next.indexOf(neighborIdentity);
+	if (movedIndex >= 0 && neighborIndex >= 0) {
+		[next[movedIndex], next[neighborIndex]] = [next[neighborIndex]!, next[movedIndex]!];
+	}
+	return next;
+}
+
+/**
+ * Order-preserving, deduping identity migration for a manual-order array,
+ * mirroring migrateAgentsViewIdentitySet's alias rewrite for the set-shaped
+ * expandedSubagentParents/programShownParents state. Entries with no current
+ * alias match are kept unresolved: the record may not have streamed in yet.
+ */
+function migrateAgentsViewManualOrderList(
+	identities: readonly string[],
+	byKey: ReadonlyMap<string, UnifiedSessionRecord>,
+): string[] {
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const identity of identities) {
+		const record = byKey.get(identity);
+		const resolved = record ? record.identity : identity;
+		if (seen.has(resolved)) continue;
+		seen.add(resolved);
+		result.push(resolved);
+	}
+	return result;
+}
+
+/** Migrate every section's manual order in one pass, for use alongside migrateAgentsViewIdentitySet on each roster refresh. */
+export function migrateAgentsViewManualOrder(
+	manualOrder: AgentsViewManualOrder,
+	byKey: ReadonlyMap<string, UnifiedSessionRecord>,
+): AgentsViewManualOrder {
+	const migrated: AgentsViewManualOrder = {};
+	for (const section of AGENTS_VIEW_SECTIONS) {
+		const list = manualOrder[section];
+		if (!list) continue;
+		migrated[section] = migrateAgentsViewManualOrderList(list, byKey);
+	}
+	return migrated;
+}
+
+/**
+ * Drop manual-order entries for sessions that no longer exist anywhere
+ * (deleted, archived) -- never entries that merely left this section for
+ * another one. A retained entry restores the session's pinned slot if it
+ * re-enters the section later.
+ */
+export function pruneAgentsViewManualOrder(
+	manualOrder: AgentsViewManualOrder,
+	knownIdentities: ReadonlySet<string>,
+): AgentsViewManualOrder {
+	const pruned: AgentsViewManualOrder = {};
+	for (const section of AGENTS_VIEW_SECTIONS) {
+		const list = manualOrder[section];
+		if (!list) continue;
+		const filtered = list.filter((identity) => knownIdentities.has(identity));
+		if (filtered.length > 0) pruned[section] = filtered;
+	}
+	return pruned;
+}
+
+const AGENTS_VIEW_SECTIONS: readonly AgentsViewSection[] = ["running", "idle", "inactive"];
 
 function buildRowKeyMap(rows: readonly MutableAgentsViewRow[]): Map<string, MutableAgentsViewRow> {
 	const rowsByKey = new Map<string, MutableAgentsViewRow>();

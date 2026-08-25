@@ -32,12 +32,14 @@ export type {
 export { DaemonAgentConnection, InProcessAgentConnection } from "./agent-connection/index.js";
 export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/agents-view-mode.js";
 export {
+	type AgentsViewManualOrder,
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
 	type AgentsViewScopeKey,
 	type AgentsViewSection,
 	type AgentsViewSelectionKey,
 	aggregateSessionHeartbeats,
+	applyAgentsViewManualMove,
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
 	classifyAgentsViewSession,
@@ -48,6 +50,10 @@ export {
 	getAgentsViewSessionTitle,
 	getUnifiedSessionAncestorSessionIds,
 	hasUnifiedSessionChildren,
+	migrateAgentsViewManualOrder,
+	orderAgentsViewRoots,
+	orderSectionRows,
+	pruneAgentsViewManualOrder,
 	reconcileUnifiedSessions,
 	resolveAgentsViewLeftResult,
 	resolveAgentsViewScopeFrames,
