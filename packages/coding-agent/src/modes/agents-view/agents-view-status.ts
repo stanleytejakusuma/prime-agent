@@ -44,9 +44,14 @@ export interface AgentsViewStatusLineData {
 	/** Scope label: scoped session title, or "global" for the root view. */
 	scopeLabel?: string;
 	depth: number;
+	/** Milliseconds since the last successfully decoded daemon frame. Undefined
+	 *  means no frame has ever been decoded (unknown), never healthy. */
+	daemonFrameAgeMs?: number;
 }
 
 const GIT_BRANCH_TTL_MS = 15_000;
+/** A daemon frame older than this is stale. Poll runs at 1s, so 3s is 3 missed polls. */
+const DAEMON_FRAME_STALE_MS = 3000;
 const GIT_BRANCH_NEGATIVE_TTL_MS = 15_000;
 const GIT_BRANCH_MAX_CACHE_ENTRIES = 64;
 const GIT_BRANCH_RESOLVE_TIMEOUT_MS = 2000;
@@ -193,6 +198,31 @@ function buildUsageLine(usage: SessionUsageSnapshot): string {
 }
 
 /**
+ * Control-plane trust capsule (Red inspiration 2026-08-24). Leftmost element
+ * of line 2. If the daemon feed is stale or misdecoded, every other footer
+ * value can look plausible while being wrong, so the capsule is the first
+ * thing the eye should hit. Missing data renders as unknown, never healthy.
+ *
+ * "Uncertain" (Red review 2026-08-24) includes undefined (no frame decoded
+ * yet), non-finite values, and negative ages (a backward wall-clock
+ * adjustment between the stamp and this render): all three fall to "D?",
+ * never to the healthy "D\u2713" state. The threshold is tied to
+ * POLL_INTERVAL_MS (agents-view-mode.ts, 1000ms): roughly three missed poll
+ * cycles under normal low-latency conditions, not an exact failed-attempt
+ * count (attempt count is not tracked here).
+ */
+function renderDaemonTrustCapsule(ageMs: number | undefined): string {
+	if (ageMs === undefined || !Number.isFinite(ageMs) || ageMs < 0) {
+		return "D?";
+	}
+	const seconds = Math.floor(ageMs / 1000);
+	if (ageMs > DAEMON_FRAME_STALE_MS) {
+		return `D! STALE ${seconds}s`;
+	}
+	return `D\u2713 ${seconds}s`;
+}
+
+/**
  * Build the three-line agents-view status footer. Always returns exactly
  * three lines (a blank dim placeholder fills a slot with nothing to show),
  * so dock height never varies with selection or data availability. Pure and
@@ -233,8 +263,8 @@ export function buildAgentsViewStatusLines(data: AgentsViewStatusLineData, width
 		}
 	}
 
-	// Line 2: roster summary, always present.
-	const rosterParts: string[] = [data.countsText];
+	// Line 2: trust capsule first, then roster summary. Both always present.
+	const rosterParts: string[] = [renderDaemonTrustCapsule(data.daemonFrameAgeMs), data.countsText];
 	const scopeLabel = data.scopeLabel ? sanitizeInline(data.scopeLabel) : undefined;
 	if (scopeLabel) {
 		rosterParts.push(`scope ${scopeLabel}`);

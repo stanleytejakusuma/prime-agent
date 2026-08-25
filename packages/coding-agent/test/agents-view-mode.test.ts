@@ -577,6 +577,39 @@ describe("AgentsViewMode", () => {
 		expect(rows.map((row) => row.summary.sessionId)).toEqual(["older-session", "newer-session"]);
 	});
 
+	it("stamps the decoded-daemon-frame time on a successful roster apply (trust capsule source)", () => {
+		const self: Record<string, unknown> = {
+			persistentState: {},
+			lastListedSummaries: [],
+			lastDecodedDaemonFrameAt: undefined,
+			savedSessions: [],
+			heartbeats: [],
+			inactiveAgentIdentities: new Set(),
+			pendingDeleteAgent: undefined,
+			expandedSubagentParents: new Set(),
+			programShownParents: new Set(),
+			manualOrder: {},
+			editor: { getText: () => "" },
+			getFilteredRecords: () => [],
+			applyPendingAncestorExpansion: vi.fn(),
+			restoreSelection: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			setStatusMessage: vi.fn(),
+			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			reconcileCatalogs: vi.fn(),
+		};
+		const before = Date.now();
+		invoke("applySessionList", self, [], true);
+		const stamped = Reflect.get(self, "lastDecodedDaemonFrameAt") as number;
+		expect(stamped).toBeGreaterThanOrEqual(before);
+		expect(stamped).toBeLessThanOrEqual(Date.now());
+
+		// An unsuccessful apply must not stamp (a failed refresh is not fresh).
+		Reflect.set(self, "lastDecodedDaemonFrameAt", undefined);
+		invoke("applySessionList", self, [], false);
+		expect(Reflect.get(self, "lastDecodedDaemonFrameAt")).toBeUndefined();
+	});
+
 	it("carries the resolved scope root across view remounts", () => {
 		const root = summary({ sessionName: "Scoped root" });
 		const persistentState: AgentsViewPersistentState = {
@@ -1199,6 +1232,43 @@ describe("AgentsViewMode persistent catalog state", () => {
 			});
 			await expect(invoke("refreshSessions", view)).resolves.toBe(true);
 			expect(persistentState.scopeFrames).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("repaints on every failed reconnect retry tick, not just at the start or end (trust capsule liveness)", async () => {
+		// Red review 2026-08-24: without a render on every retry tick, the footer
+		// (including the trust capsule) can freeze on its pre-outage state for the
+		// entire reconnect window, since neither setStatusMessage's timeout-exit
+		// call (render: false) nor the retry loop itself previously requested a
+		// render between attempts.
+		vi.useFakeTimers();
+		const persistentState: AgentsViewPersistentState = {};
+		const view = new AgentsViewMode(
+			{ config: {}, uiServices: createUiServices(), reconnectTimeoutMs: 10_000 },
+			persistentState,
+		);
+		const client = {
+			isConnected: false,
+			reconnect: vi.fn(async () => {
+				throw new Error("still down");
+			}),
+		};
+		Reflect.set(view, "client", client);
+		const ui = Reflect.get(view, "ui") as { requestRender: () => void };
+		const renderSpy = vi.spyOn(ui, "requestRender");
+
+		try {
+			const reconnecting = invoke("reconnectClient", view, client, new Error("disconnected")) as Promise<void>;
+			renderSpy.mockClear();
+			// Advance past several failed retry ticks, well before the 10s deadline.
+			await vi.advanceTimersByTimeAsync(1000 * 3 + 50); // RECONNECT_RETRY_MS is module-private; mirror its value
+			expect(renderSpy.mock.calls.length).toBeGreaterThanOrEqual(3);
+
+			// Let it run to the deadline so the promise settles cleanly.
+			await vi.advanceTimersByTimeAsync(15_000);
+			await reconnecting;
 		} finally {
 			vi.useRealTimers();
 		}

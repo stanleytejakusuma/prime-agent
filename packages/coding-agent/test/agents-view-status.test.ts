@@ -113,7 +113,7 @@ describe("buildAgentsViewStatusLines", () => {
 		expect(plain[0]).toContain("Prime Agent Onboarding");
 		expect(plain[0]).toContain("ox-alpha:max");
 		expect(plain[0]).toContain("77.0k (39%)");
-		expect(plain[1]).toBe("3 running, 1 idle, 5 inactive · scope global · depth0");
+		expect(plain[1]).toBe("D? · 3 running, 1 idle, 5 inactive · scope global · depth0");
 		expect(plain[2]).toContain("↑12.3k");
 		expect(plain[2]).toContain("↓678");
 		expect(plain[2]).toContain("R12.3k");
@@ -140,7 +140,7 @@ describe("buildAgentsViewStatusLines", () => {
 		);
 		const plain = lines.map(stripAnsi);
 		expect(plain[0].trim()).toBe("");
-		expect(plain[1]).toBe("0 running, 0 idle, 1 inactive · scope scoped · depth2");
+		expect(plain[1]).toBe("D? · 0 running, 0 idle, 1 inactive · scope scoped · depth2");
 		expect(plain[2].trim()).toBe("");
 	});
 
@@ -217,6 +217,143 @@ describe("buildAgentsViewStatusLines", () => {
 		// No cache entry yet: renders the cwd without a branch, does not block.
 		expect(stripAnsi(linesBeforeCache[0])).not.toMatch(/\([^)]+\)/);
 		expect(peekCachedGitBranch("/tmp/cache-miss-project")).toBeUndefined();
+	});
+});
+
+describe("control-plane trust capsule (line 2)", () => {
+	it("renders a fresh capsule as D with a check and the frame age in seconds", () => {
+		const lines = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "1 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 500,
+			},
+			120,
+		);
+		const plain = lines.map(stripAnsi);
+		expect(plain[1]).toMatch(/^D\u2713 0s \u00b7 1 running, 0 idle, 0 inactive/);
+	});
+
+	it("renders an unknown capsule when no daemon frame has ever been decoded", () => {
+		const lines = buildAgentsViewStatusLines(
+			{ summary: undefined, countsText: "0 running, 0 idle, 1 inactive", scopeLabel: "global", depth: 0 },
+			120,
+		);
+		const plain = lines.map(stripAnsi);
+		expect(plain[1]).toMatch(/^D\? \u00b7 0 running, 0 idle, 1 inactive/);
+	});
+
+	it("renders a stale capsule once the frame age exceeds the threshold", () => {
+		const lines = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "1 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 6000,
+			},
+			120,
+		);
+		const plain = lines.map(stripAnsi);
+		expect(plain[1]).toMatch(/^D! STALE 6s \u00b7 1 running, 0 idle, 0 inactive/);
+	});
+
+	it("keeps the roster summary intact when the capsule is present", () => {
+		const lines = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "3 running, 1 idle, 5 inactive",
+				scopeLabel: "scoped",
+				depth: 2,
+				daemonFrameAgeMs: 100,
+			},
+			120,
+		);
+		const plain = lines.map(stripAnsi);
+		expect(plain[1]).toContain("3 running, 1 idle, 5 inactive \u00b7 scope scoped \u00b7 depth2");
+	});
+
+	it("stale and unknown states never render as healthy", () => {
+		const unknown = buildAgentsViewStatusLines(
+			{ summary: undefined, countsText: "0 running, 0 idle, 0 inactive", scopeLabel: "global", depth: 0 },
+			120,
+		).map(stripAnsi);
+		expect(unknown[1]).not.toMatch(/^D\u2713/);
+
+		const stale = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "0 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 30_000,
+			},
+			120,
+		).map(stripAnsi);
+		expect(stale[1]).not.toMatch(/^D\u2713/);
+	});
+
+	it("treats a negative or non-finite age as unknown, never as healthy (clock-rollback safety)", () => {
+		// Red review 2026-08-24: Date.now() - earlierStamp can go negative across
+		// a backward wall-clock adjustment. A negative or non-finite age must
+		// render "D?" (unknown), never "D\u2713" (healthy) or a garbage value like
+		// "D\u2713 NaNs".
+		for (const badAge of [-1, -30_000, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+			const lines = buildAgentsViewStatusLines(
+				{
+					summary: undefined,
+					countsText: "0 running, 0 idle, 0 inactive",
+					scopeLabel: "global",
+					depth: 0,
+					daemonFrameAgeMs: badAge,
+				},
+				120,
+			).map(stripAnsi);
+			expect(lines[1]).toMatch(/^D\?/);
+			expect(lines[1]).not.toContain("NaN");
+			expect(lines[1]).not.toMatch(/^D\u2713/);
+			expect(lines[1]).not.toMatch(/^D!/);
+		}
+	});
+
+	it("renders boundary ages correctly: just under, at, and just over the stale threshold", () => {
+		const justUnder = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "0 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 2999,
+			},
+			120,
+		).map(stripAnsi);
+		expect(justUnder[1]).toMatch(/^D\u2713/);
+
+		const atThreshold = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "0 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 3000,
+			},
+			120,
+		).map(stripAnsi);
+		expect(atThreshold[1]).toMatch(/^D\u2713/);
+
+		const justOver = buildAgentsViewStatusLines(
+			{
+				summary: undefined,
+				countsText: "0 running, 0 idle, 0 inactive",
+				scopeLabel: "global",
+				depth: 0,
+				daemonFrameAgeMs: 3001,
+			},
+			120,
+		).map(stripAnsi);
+		expect(justOver[1]).toMatch(/^D! STALE/);
 	});
 });
 
