@@ -41,6 +41,7 @@ import {
 	readActiveOrphanProcesses,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import { sweepDeadRlmWorktreeSessions } from "../../core/rlm-worktrees.js";
 import {
 	canEvictWorker,
 	type IdleEvictionMinutes,
@@ -766,6 +767,23 @@ export class DaemonSupervisor {
 				throw adoptionFailure;
 			}
 			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
+			// Host-level orphan sweep: reap rlm worktrees whose parent session is not
+			// in the daemon's live session set (bounded by the global cap + this sweep).
+			try {
+				const liveSessions = await this.catalog.list();
+				const liveSessionIds = new Set(liveSessions.map((session) => session.id));
+				const sweepReport = await sweepDeadRlmWorktreeSessions({
+					agentDir,
+					isSessionLive: (parentSessionId) => liveSessionIds.has(parentSessionId),
+				});
+				if (sweepReport.length > 0) {
+					this.log(
+						`RLM worktree host sweep: ${sweepReport.map((entry) => `${entry.childId}:${entry.outcome}`).join(", ")}`,
+					);
+				}
+			} catch (error) {
+				this.log(`RLM worktree host sweep failed: ${String(error)}`);
+			}
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}

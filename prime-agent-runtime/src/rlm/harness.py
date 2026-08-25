@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,72 @@ _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
+
+_FANOUT_KEYS = frozenset({"over", "template", "sentinel"})
+_FANOUT_SENTINEL_RE = re.compile(r"^RLM_FANOUT_ITEM_[0-9A-F]{16}$")
+
+
+class _FanOutRemove:
+    """Module-level singleton marking explicit fan_out removal on update_subagent."""
+
+    def __repr__(self) -> str:
+        return "FANOUT_REMOVE"
+
+
+FANOUT_REMOVE: Any = _FanOutRemove()
+
+
+def _validate_fan_out(fan_out: Any) -> dict[str, Any]:
+    if not isinstance(fan_out, dict):
+        raise ValueError(f"fan_out must be a dict, got {type(fan_out).__name__}")
+    unknown = set(fan_out) - _FANOUT_KEYS
+    if unknown:
+        raise ValueError(
+            f"fan_out has unknown keys {sorted(unknown)!r}; expected only {sorted(_FANOUT_KEYS)!r}"
+        )
+    over = fan_out.get("over")
+    template = fan_out.get("template")
+    sentinel = fan_out.get("sentinel")
+    if not isinstance(over, str) or not over:
+        raise ValueError("fan_out.over must be a non-empty str")
+    if not isinstance(template, str) or not template:
+        raise ValueError("fan_out.template must be a non-empty str")
+    if not isinstance(sentinel, str) or not sentinel:
+        raise ValueError("fan_out.sentinel must be a str")
+    if not _FANOUT_SENTINEL_RE.match(sentinel):
+        raise ValueError(f"fan_out.sentinel {sentinel!r} must match ^RLM_FANOUT_ITEM_[0-9A-F]{{16}}$")
+    if sentinel not in template:
+        raise ValueError(f"fan_out.sentinel {sentinel!r} must occur at least once in fan_out.template")
+    return {"over": over, "template": template, "sentinel": sentinel}
+
+
+def _resolve_subagent_fan_out(
+    fan_out: Any,
+    metadata: dict[str, Any] | None,
+    *,
+    existing: dict[str, Any] | None,
+    allow_remove: bool,
+) -> dict[str, Any] | None:
+    """Validate and merge fan_out into subagent metadata BEFORE any write happens."""
+    metadata_has_fanout = isinstance(metadata, dict) and "fan_out" in metadata
+    if fan_out is not None and metadata_has_fanout:
+        raise ValueError('pass either fan_out= or metadata={"fan_out": ...}, not both')
+    if fan_out is FANOUT_REMOVE:
+        if not allow_remove:
+            raise ValueError("fan_out=FANOUT_REMOVE is only valid on update_subagent")
+        merged = dict(existing or {})
+        merged.pop("fan_out", None)
+        return merged
+    if fan_out is not None:
+        validated = _validate_fan_out(fan_out)
+        base = dict(metadata) if metadata is not None else dict(existing or {})
+        base["fan_out"] = validated
+        return base
+    if metadata_has_fanout:
+        metadata = dict(metadata)
+        metadata["fan_out"] = _validate_fan_out(metadata["fan_out"])
+        return metadata
+    return dict(metadata) if metadata is not None else None
 
 
 def _now() -> str:
@@ -653,9 +720,11 @@ class HarnessState:
         id: str | None = None,
         path: str = "general",
         metadata: dict[str, Any] | None = None,
+        fan_out: Any = None,
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
+        metadata = _resolve_subagent_fan_out(fan_out, metadata, existing=None, allow_remove=False)
         return self.create("subagent", title, content, id=id, path=path, metadata=metadata, global_=global_, **kwargs)
 
     def update_subagent(
@@ -666,9 +735,19 @@ class HarnessState:
         *,
         path: str | None = None,
         metadata: dict[str, Any] | None = None,
+        fan_out: Any = None,
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
+        # Read the existing entry from the same store update() will write to, so a
+        # global_=True update resolves its current metadata before the fan_out merge.
+        global_target = self._global_target(global_, {"global": kwargs["global"]} if "global" in kwargs else None)
+        store: HarnessState = global_target if global_target is not None else self
+        stripped_id, _ = _strip_scope_prefix(id, global_)
+        existing_entry = store.get("subagent", stripped_id)
+        if existing_entry is None:
+            raise ValueError(f"subagent entry {id!r} does not exist")
+        metadata = _resolve_subagent_fan_out(fan_out, metadata, existing=existing_entry.metadata, allow_remove=True)
         return self.update("subagent", id, title, content, path=path, metadata=metadata, global_=global_, **kwargs)
 
     def delete_subagent(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
@@ -811,6 +890,7 @@ def get_harness_state(
 
 
 __all__ = [
+    "FANOUT_REMOVE",
     "HarnessEntry",
     "HarnessKind",
     "HarnessScope",

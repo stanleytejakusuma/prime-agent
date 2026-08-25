@@ -17,6 +17,11 @@ export interface RlmSpawnHandle {
 	name: string;
 	session_dir: string;
 	model: string;
+	isolation?: "worktree";
+	worktree_path?: string;
+	worktree_branch?: string;
+	preservation_ref?: string;
+	worktree_status?: string;
 }
 
 export type RlmSubagentRegistryStatus = "running" | "completed" | "error";
@@ -28,6 +33,11 @@ export interface RlmSubagentRegistryEntry {
 	session_name: string;
 	session_dir: string;
 	status: RlmSubagentRegistryStatus;
+	isolation?: "worktree";
+	worktree_path?: string;
+	worktree_branch?: string;
+	preservation_ref?: string;
+	worktree_status?: string;
 }
 
 export interface RlmListSubagentsResult {
@@ -102,6 +112,20 @@ export function normalizeRequestedRlmSubagentModel(value: unknown): string | und
 		throw new Error("rlm.run model must not be empty");
 	}
 	return model;
+}
+
+/** The only accepted isolation value: "worktree" (undefined/null means no isolation). */
+export function normalizeRequestedRlmIsolation(value: unknown): "worktree" | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	if (typeof value !== "string") {
+		throw new Error('rlm.run isolation must be "worktree" when provided');
+	}
+	if (value.trim() !== "worktree") {
+		throw new Error('rlm.run isolation must be "worktree" when provided');
+	}
+	return "worktree";
 }
 
 /** Create a readable, collision-resistant default name usable as an agent-message selector. */
@@ -235,6 +259,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmParentNodeId: string;
 	/** Source of the IPython cell that spawned this subagent, for display. */
 	spawnCode?: string;
+	/** Override the child cwd (worktree isolation); defaults to the parent's cwd. */
+	cwdOverride?: string;
 	/** Publish the session to the parent before a host makes the runtime addressable. */
 	onSessionPublished?: (session: AgentSession) => void;
 }
