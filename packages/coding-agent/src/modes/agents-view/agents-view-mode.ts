@@ -1844,8 +1844,17 @@ export class AgentsViewMode implements Component, Focusable {
 					this.lastListedSummaries = latest;
 					const active = resolveAgentsViewActiveSummaryForPath(row.summary.sessionFile, latest);
 					if (active) {
+						// The saved row was actually live all along (e.g. an empty draft
+						// whose daemon activity flag is stuck on "working"). Promote the
+						// confirmed delete to the live-session stop-then-delete flow so
+						// the user's next Ctrl+X stops it and completes the delete,
+						// instead of refusing with "Session became active; stop it
+						// before deleting" and trapping the row in the TUI.
 						this.pendingDeleteAgent = undefined;
-						this.setStatusMessage("Session became active; stop it before deleting", { tone: "warning" });
+						this.setStatusMessage("Session is live; stopping it, press Ctrl+X again to delete", {
+							render: false,
+						});
+						await this.stopAgentForDeletion({ ...row, summary: active });
 						await this.refreshSessions();
 						return;
 					}
