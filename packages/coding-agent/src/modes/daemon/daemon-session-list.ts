@@ -225,7 +225,7 @@ export function summaryForActiveSession(
 		sessionId: session.sessionId,
 		sessionFile: session.sessionFile,
 		sessionName: session.sessionName,
-		cwd: session.sessionManager.getCwd(),
+		cwd: savedSession?.cwd ?? session.sessionManager.getCwd(),
 		model: session.model as Model<Api> | undefined,
 		thinkingLevel: session.thinkingLevel,
 		isStreaming: session.isStreaming,

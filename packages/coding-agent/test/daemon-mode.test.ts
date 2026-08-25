@@ -10354,3 +10354,109 @@ function makeClient(id: string, activeSessionId: string, supportsExtensionUi = f
 		capabilities: new Set(supportsExtensionUi ? ["extension_ui"] : []),
 	};
 }
+
+describe("createRuntime cwd resolution on resume (fork fix: cwd-resume)", () => {
+	it("keeps the session's persisted cwd on resume, even when the client's ambient cwd differs", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-cwd-resume-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const projectCwd = join(tempDir, "project", "subdir");
+			mkdirSync(projectCwd, { recursive: true });
+
+			// Persist a session whose header cwd is the project subdirectory (as if
+			// it was originally created from there).
+			const manager = SessionManager.create(projectCwd, sessionDir);
+			manager.newSession();
+			manager.appendSessionInfo("resume-cwd-fixture");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Missing session file");
+
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+				session: makeRuntimeSession(options.sessionManager),
+				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["extensionsResult"],
+				services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["services"],
+				diagnostics: [],
+			}));
+
+			// The daemon's own default launch cwd differs from the project cwd too,
+			// simulating the daemon having been started from an unrelated directory
+			// (e.g. the SYMIR workspace root).
+			const daemonLaunchCwd = join(tempDir, "daemon-launch-root");
+			mkdirSync(daemonLaunchCwd, { recursive: true });
+
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: daemonLaunchCwd, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+
+			// Resume from a client whose OWN ambient cwd is yet another unrelated
+			// directory (e.g. a terminal opened at the SYMIR root, ~/codebase).
+			const clientAmbientCwd = join(tempDir, "client-terminal-cwd");
+			mkdirSync(clientAmbientCwd, { recursive: true });
+
+			const state = await internals.createRuntime({
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: clientAmbientCwd },
+			});
+
+			// The resumed session must keep its PERSISTED cwd (the project
+			// subdirectory), not the client's ambient launch cwd and not the
+			// daemon's own launch cwd. This is the fork fix: cwdOverride is only
+			// applied when genuinely creating a session (no sessionPath), never on
+			// resume of an existing one.
+			expect(state.runtime.session.sessionManager.getCwd()).toBe(projectCwd);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("still honors the client's ambient cwd when genuinely creating a brand new session", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-cwd-new-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const daemonLaunchCwd = join(tempDir, "daemon-launch-root");
+			mkdirSync(daemonLaunchCwd, { recursive: true });
+
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+				session: makeRuntimeSession(options.sessionManager),
+				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["extensionsResult"],
+				services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["services"],
+				diagnostics: [],
+			}));
+
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: daemonLaunchCwd, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+
+			const newProjectCwd = join(tempDir, "brand-new-project");
+			mkdirSync(newProjectCwd, { recursive: true });
+
+			// No sessionPath: this is a genuinely new session, so the client's
+			// ambient cwd SHOULD be used (unchanged behavior).
+			const state = await internals.createRuntime({
+				type: "create",
+				config: { cwd: newProjectCwd },
+			});
+
+			expect(state.runtime.session.sessionManager.getCwd()).toBe(newProjectCwd);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+});
