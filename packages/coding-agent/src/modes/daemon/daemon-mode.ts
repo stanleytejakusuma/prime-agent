@@ -96,8 +96,13 @@ import {
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
-import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import { deleteSessionArtifacts, deleteSessionFile, sweepGhostSessionFiles } from "../../core/session-file-actions.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	type SessionLease,
+	sweepStaleSessionLeases,
+} from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
 	readSessionInfo,
@@ -665,6 +670,39 @@ export class AgentDaemon {
 			this.cronScheduler.start();
 		}
 		this.startSupervisorMonitor();
+		if (!this.options.worker) {
+			// Only the top-level supervisor sweeps, never a per-session worker
+			// process. Fire-and-forget: startup must never block on this, and a
+			// sweep failure is diagnostic-only (fork fix: ghost-sweep).
+			void this.sweepStaleStartupState();
+		}
+	}
+
+	/**
+	 * Best-effort cleanup at daemon startup: reclaim session leases left
+	 * behind by crashed or killed processes, then delete the resulting ghost
+	 * session files those orphaned leases were blocking from being resolved
+	 * as deletable (fork fix: ghost-sweep). See sweepStaleSessionLeases and
+	 * sweepGhostSessionFiles for the safety invariants.
+	 */
+	private async sweepStaleStartupState(): Promise<void> {
+		try {
+			const staleLeases = sweepStaleSessionLeases(this.agentDir);
+			if (staleLeases > 0) {
+				this.log(`swept ${staleLeases} stale session lease(s) at startup`);
+			}
+		} catch (error) {
+			this.log(`session lease sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		try {
+			const sessionDir = this.options.defaultSessionConfig.sessionDir ?? getSessionsDir(this.agentDir);
+			const ghostFiles = await sweepGhostSessionFiles(sessionDir, this.agentDir);
+			if (ghostFiles > 0) {
+				this.log(`swept ${ghostFiles} ghost session file(s) at startup`);
+			}
+		} catch (error) {
+			this.log(`ghost session sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 
 	private supervisorSocketPathFromEnv(): string | undefined {

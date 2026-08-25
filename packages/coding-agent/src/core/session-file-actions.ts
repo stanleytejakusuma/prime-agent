@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
+import { readLinesAsBuffers } from "../utils/file-lines.js";
+import { hasLiveSessionLease } from "./session-lease.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
@@ -71,4 +73,92 @@ export async function deleteSessionFile(
 		await deleteSessionArtifacts(sessionPath);
 	}
 	return result;
+}
+
+// Entry types that are always present when a session is created and carry no
+// user-visible content on their own. A file whose only entries fall in this
+// set holds nothing worth keeping (fork fix: ghost-sweep).
+const GHOST_DRAFT_ENTRY_TYPES = new Set([
+	"session",
+	"model_change",
+	"thinking_level_change",
+	"service_tier_change",
+	"session_state",
+]);
+
+/**
+ * True when a session file is an empty draft: it has no message entries and
+ * every entry present is a bootstrap/state entry (fork fix: ghost-sweep).
+ * These are ghost sessions -- created on disk for crash recovery bookkeeping
+ * but never sent a message -- which the agents view shows as an undeletable
+ * "(no messages)" row because the daemon still resolves an orphaned lease as
+ * active.
+ *
+ * A passive RLM child that finished its work shares this exact on-disk
+ * shape. The caller is responsible for checking lease liveness separately
+ * (see hasLiveSessionLease) before treating a match here as safe to delete.
+ */
+export async function isEmptyDraftSessionFile(sessionPath: string): Promise<boolean> {
+	try {
+		let sawAnyEntry = false;
+		for await (const lineBuffer of readLinesAsBuffers(sessionPath)) {
+			const line = lineBuffer.toString("utf8").trim();
+			if (!line) continue;
+			let entry: { type?: unknown };
+			try {
+				entry = JSON.parse(line) as { type?: unknown };
+			} catch {
+				// An unparseable line means this file is not a clean, empty draft;
+				// leave it alone rather than risk deleting something with real
+				// (if malformed) content.
+				return false;
+			}
+			sawAnyEntry = true;
+			if (typeof entry.type !== "string" || !GHOST_DRAFT_ENTRY_TYPES.has(entry.type)) {
+				return false;
+			}
+		}
+		return sawAnyEntry;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Delete every ghost session file in sessionDir: empty drafts with no live
+ * lease (fork fix: ghost-sweep). Never touches a file with a live lease, so
+ * a legitimate in-progress or passive RLM child session -- which can share
+ * the exact same on-disk shape -- is never at risk.
+ *
+ * Ports only the verified-safe half of the logic bisected from an earlier
+ * upstream PR (#1079); see sweepStaleSessionLeases in session-lease.ts for
+ * the corresponding note on the deliberately-excluded regression.
+ */
+export async function sweepGhostSessionFiles(sessionDir: string, agentDir: string): Promise<number> {
+	if (!existsSync(sessionDir)) {
+		return 0;
+	}
+	let entries: string[];
+	try {
+		entries = readdirSync(sessionDir);
+	} catch {
+		return 0;
+	}
+	let swept = 0;
+	for (const entry of entries) {
+		if (!entry.endsWith(".jsonl")) {
+			continue;
+		}
+		const sessionPath = join(sessionDir, entry);
+		if (hasLiveSessionLease(agentDir, sessionPath)) {
+			continue;
+		}
+		if (await isEmptyDraftSessionFile(sessionPath)) {
+			const result = await deleteSessionFile(sessionPath);
+			if (result.ok) {
+				swept++;
+			}
+		}
+	}
+	return swept;
 }
